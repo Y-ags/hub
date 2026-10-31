@@ -1,0 +1,10 @@
+[package]
+name = "hub-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hub-core = { path = "../hub-core" }
+hub-store = { path = "../hub-store" }
+hub-connectors = { path = "../hub-connectors" }

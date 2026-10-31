@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hub-core",
+    "crates/hub-store",
+    "crates/hub-connectors",
+    "crates/hub-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Tantivy 0.26.1 的 MSRV。注意：必须在每个 crate 里写 `rust-version.workspace = true`
+# 才会真正继承，否则它只是一行装饰 —— cargo 不会因此报错。
+rust-version = "1.86"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

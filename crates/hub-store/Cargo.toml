@@ -1,0 +1,38 @@
+[package]
+name = "hub-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# 版本全部锁定。理由见 README「纠错清单」——这些版本号写错会直接编译失败或拉到不一致依赖。
+[dependencies]
+hub-core = { path = "../hub-core" }
+
+# ── 检索层 ──────────────────────────────────────────────
+# 0.26.1 已验证可用，先锁死；0.27 API 有变，迁移前需隔离分支验证。
+tantivy = "=0.26.1"
+
+# ── 中文分词 ────────────────────────────────────────────
+# 不再引入 cang-jie / jieba-rs。
+#
+# 原因：本项目的中文分词由 hub-core 自己定义（词级最大正向匹配 + bigram 融合），
+# 查询词也是用同一套算法切出来的。如果索引侧用 jieba、查询侧用 hub-core 的词典，
+# 两套词表切出来的 term 对不上，检索直接失效——这是第一版最隐蔽的语义断裂。
+# 现在通过 `hub_word` / `hub_bigram` 两个自定义 Tantivy 分词器注册同一套算法，
+# 索引与查询共用一份词表，语义才真正一致；顺带消掉了 jieba-rs 双版本（E0308）的坑。
+
+# ── 元数据层 ────────────────────────────────────────────
+# ⚠️ features 里只能有 "bundled"。绝对不要写 "fts5"。
+#
+# 原因：fts5 是 SQLite 的编译开关（SQLITE_ENABLE_FTS5），不是 cargo feature。
+# rusqlite 暴露的 feature 只有 bundled / csv / 等，没有 fts5。写了会报：
+#     package `hub-store` depends on `rusqlite` with feature `fts5`
+#     but `rusqlite` does not have that feature. (it does have feature `csv`)
+#
+# 而 bundled 会编译 SQLite 官方 amalgamation，其中默认已开启 FTS5，
+# 所以真要用 USING fts5 时，也只要这一个 "bundled" 就够了，无需再声明。
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[dev-dependencies]
+# 集成测试要构造临时索引目录，不能污染用户真实数据目录
+tempfile = "3"

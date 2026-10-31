@@ -1,0 +1,9 @@
+[package]
+name = "hub-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# 零外部依赖：本 crate 只用 std，保证 `cargo test -p hub-core` 在任何有 Rust 的机器上都能跑通，
+# 不需要下载任何 crate。查询解析 / 中文分词 / BM25 / tombstone 的正确性全部由本 crate 的单元测试覆盖。
+[dependencies]

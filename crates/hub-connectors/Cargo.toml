@@ -1,0 +1,14 @@
+[package]
+name = "hub-connectors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# 采集层零外部依赖：只用 std。
+# 目录遍历自己写而不引 walkdir —— 需要的功能（跳过规则、深度限制、软链保护、
+# 二进制嗅探）加起来不到 150 行，多一个依赖就多一个版本约束。
+[dependencies]
+hub-core = { path = "../hub-core" }
+
+[dev-dependencies]
+tempfile = "3"
