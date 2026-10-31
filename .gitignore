@@ -1,5 +1,6 @@
 /target
 /.hub
+/.workbuddy
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
