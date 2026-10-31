@@ -81,12 +81,19 @@ impl Default for WalkOptions {
 }
 
 impl WalkOptions {
-    fn skip_dir(&self, name: &str) -> bool {
+    /// 目录名是否在跳过列表里。
+    ///
+    /// 公开是必须的：watcher 收到的是**单文件绝对路径**，没有遍历过程可依赖，
+    /// 只能拿着路径自己判断"这个文件该不该进索引"。如果这里保持私有，
+    /// daemon 就得复制一份跳过规则 —— 两份规则迟早分叉，
+    /// 表现是"手动 index 时被跳过、后台却索引进去了"。
+    pub fn skip_dir(&self, name: &str) -> bool {
         let l = name.to_ascii_lowercase();
         SKIP_DIRS.contains(&l.as_str())
     }
 
-    fn skip_ext(&self, path: &Path) -> bool {
+    /// 扩展名是否在跳过列表里
+    pub fn skip_ext(&self, path: &Path) -> bool {
         match path.extension().and_then(|e| e.to_str()) {
             Some(ext) => {
                 let l = ext.to_ascii_lowercase();
@@ -94,6 +101,54 @@ impl WalkOptions {
             }
             None => false,
         }
+    }
+
+    /// 判断一个**相对于 root** 的路径是否该被索引。
+    ///
+    /// 这是给 watcher 用的正确版本：跳过规则只该看"用户配置的根目录以下"那一段。
+    /// 如果拿绝对路径判，`root` 自身落在 `%APPDATA%`、`%TEMP%`、`~/Library`
+    /// 这些目录下时，整棵树都会被判成噪声 —— 实测 `daemon start %TEMP%\x`
+    /// 会一条都索引不进去，而且不报错。
+    pub fn should_index_rel(&self, rel: &Path) -> bool {
+        if self.skip_ext(rel) {
+            return false;
+        }
+        if let Some(parent) = rel.parent() {
+            for comp in parent.components() {
+                if let std::path::Component::Normal(name) = comp {
+                    if let Some(s) = name.to_str() {
+                        if self.skip_dir(s) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// 判断一个**绝对路径**是否该被索引。
+    ///
+    /// ⚠️ 只有在拿不到 root 上下文时才用它（比如路径不在任何配置的根目录下）。
+    /// 它会沿整条绝对路径检查每一级目录名，所以 root 位于 `appdata` / `library`
+    /// 这类目录下时会把所有文件都判成噪声。正常路径请用
+    /// [`WalkOptions::should_index_rel`]。
+    pub fn should_index(&self, path: &Path) -> bool {
+        if self.skip_ext(path) {
+            return false;
+        }
+        if let Some(parent) = path.parent() {
+            for comp in parent.components() {
+                if let std::path::Component::Normal(name) = comp {
+                    if let Some(s) = name.to_str() {
+                        if self.skip_dir(s) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 }
 

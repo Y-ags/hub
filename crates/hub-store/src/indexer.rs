@@ -112,6 +112,12 @@ impl Indexer {
         &self.meta
     }
 
+    /// 缓冲区里还有多少条待写。daemon / connector 用它决定何时主动 flush，
+    /// 不必猜"这一批大概多大"。
+    pub fn pending_len(&self) -> usize {
+        self.pending.len() + self.deletes.len()
+    }
+
     /// connector 在读文件之前调用：mtime 没变就直接跳过，**不读文件**。
     pub fn needs_read(&self, source: SourceId, uri: &str, mtime: i64) -> Result<bool> {
         Ok(!self.meta.likely_unchanged(source, uri, mtime)?)
@@ -151,6 +157,28 @@ impl Indexer {
         self.deletes.push((source, uri.to_string()));
     }
 
+    /// 批量删除（reconcile 用）。一次 flush 里只发一次 SQL 事务。
+    pub fn delete_many<I>(&mut self, source: SourceId, uris: I)
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for u in uris {
+            self.deletes.push((source, u));
+        }
+    }
+
+    /// 删除某个路径及其子树下的所有记录，返回命中条数。
+    ///
+    /// 这是"整个目录被删掉"的正确处理：watcher 只报一条 `Remove(目录)`，
+    /// 但索引里可能有该目录下的几百条记录。daemon 拿不到这些 uri
+    /// （它不知道索引里有什么），只能让水位表自己去查。
+    pub fn delete_under(&mut self, source: SourceId, prefix: &str) -> Result<usize> {
+        let uris = self.meta.live_under(source, prefix)?;
+        let n = uris.len();
+        self.delete_many(source, uris);
+        Ok(n)
+    }
+
     /// 把缓冲的变更写盘。返回本次提交的文档数。
     pub fn flush(&mut self) -> Result<usize> {
         if self.pending.is_empty() && self.deletes.is_empty() {
@@ -172,12 +200,28 @@ impl Indexer {
             }
         }
 
+        // 删除清单里如果又有新增，说明"删了又加回来"，新增那条应该活下来
+        let deletes: Vec<(SourceId, String)> = self.deletes.drain(..).collect();
+
         let mut writer = self.index.writer(self.budget)?;
 
-        // 先删后加：同一批里"删了又加回来"时，加的那条应该活下来
-        for (source, uri) in self.deletes.drain(..) {
-            self.index.delete_doc(&writer, &uri)?;
-            self.meta.mark_deleted(source, &uri, now)?;
+        // 先删后加
+        for (_, uri) in &deletes {
+            self.index.delete_doc(&writer, uri)?;
+        }
+        if !deletes.is_empty() {
+            // 按来源分组，避免每个 uri 一次事务
+            let mut by_src: HashMap<&'static str, (SourceId, Vec<String>)> = HashMap::new();
+            for (s, uri) in &deletes {
+                by_src
+                    .entry(s.as_str())
+                    .or_insert_with(|| (*s, Vec::new()))
+                    .1
+                    .push(uri.clone());
+            }
+            for (_, (src, uris)) in by_src {
+                self.meta.mark_deleted_batch(src, &uris, now)?;
+            }
         }
         for d in &docs {
             self.index.add_doc(&writer, d)?;

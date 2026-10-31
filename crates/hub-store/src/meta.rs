@@ -13,6 +13,19 @@ use hub_core::{Doc, DocId, SourceId};
 
 use crate::Result;
 
+/// mtime 距今小于这个秒数时，不信任"mtime 相同 = 没变"的快通道。
+///
+/// 取 3 秒：足够覆盖一次保存动作产生的多轮写入（编辑器通常 truncate → write →
+/// close，几十毫秒内完成），又远小于正常编辑间隔，不会让快通道失效。
+const FRESH_WINDOW: i64 = 3;
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// 水位表里的一行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetaRow {
@@ -110,10 +123,23 @@ impl MetaStore {
     }
 
     /// 只靠 mtime 判断是否可能变过 —— 供 connector 在读文件之前调用。
+    ///
+    /// ⚠️ mtime 只精确到**秒**（`Doc.mtime` 是 unix 秒），而编辑器一次保存
+    /// 可能在同一秒内产生多轮写入。如果无条件信任"mtime 相同 = 内容没变"，
+    /// 表现是"文件明明改了，搜索还是旧内容"，而且要等到下一次全量对账才修正。
+    ///
+    /// 所以这里加了**新鲜度保护**：只有 mtime 距今超过 `FRESH_WINDOW` 秒，
+    /// 才允许走快通道跳过读取。刚改过的文件宁可多读一次 ——
+    /// 多读一个文件是微秒级开销，漏掉一次修改是用户可见的错。
     pub fn likely_unchanged(&self, source: SourceId, uri: &str, mtime: i64) -> Result<bool> {
         match self.lookup(source, uri)? {
             None => Ok(false),
-            Some(row) => Ok(row.live && row.mtime == mtime),
+            Some(row) => {
+                if !row.live || row.mtime != mtime {
+                    return Ok(false);
+                }
+                Ok(mtime + FRESH_WINDOW < now_secs())
+            }
         }
     }
 
@@ -211,6 +237,71 @@ impl MetaStore {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// 列出某来源下所有存活条目的 (uri, mtime)。
+    ///
+    /// `reconcile` 用它做**一次遍历的三种判定**：新增（水位表里没有）、
+    /// 修改（mtime 对不上）、删除（磁盘上没有）。流式回调而不是返回 Vec，
+    /// 50 万条时不会一次性吃满内存。
+    ///
+    /// 之所以连 mtime 一起给：如果只拿 uri，对账时每个文件都要再查一次
+    /// SQLite 才知道"变没变"，5 万文件就是 5 万次查询。
+    pub fn for_each_live_meta<F>(&self, source: SourceId, mut f: F) -> Result<usize>
+    where
+        F: FnMut(&str, i64),
+    {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT uri, mtime FROM doc_meta WHERE source = ?1 AND status = 'live'")?;
+        let mut rows = stmt.query(params![source.as_str()])?;
+        let mut n = 0;
+        while let Some(row) = rows.next()? {
+            let uri: String = row.get(0)?;
+            let mtime: i64 = row.get(1)?;
+            f(&uri, mtime);
+            n += 1;
+        }
+        Ok(n)
+    }
+
+    /// 批量标记删除（一次事务，避免 N 次 fsync）
+    pub fn mark_deleted_batch(&mut self, source: SourceId, uris: &[String], now: i64) -> Result<usize> {
+        if uris.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE doc_meta SET status = 'tombstone', updated_at = ?3
+                 WHERE source = ?1 AND uri = ?2 AND status = 'live'",
+            )?;
+            for u in uris {
+                stmt.execute(params![source.as_str(), u, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(uris.len())
+    }
+
+    /// 找出某个路径**及其子树**下的所有存活记录。
+    ///
+    /// 用于"整个目录被删掉"的场景：watcher 只会报一条 `Remove(C:/code/proj)`，
+    /// 但索引里可能有这个目录下的几百条记录。只按 uri 精确匹配会把它们全部漏掉。
+    ///
+    /// 边界要精确：`C:/code/proj` 不能匹配到 `C:/code/proj2`，
+    /// 所以是 `uri = prefix` 或 `uri LIKE prefix/%`，而不是裸的 `prefix%`。
+    pub fn live_under(&self, source: SourceId, prefix: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            r"SELECT uri FROM doc_meta
+              WHERE source = ?1 AND status = 'live'
+                AND (uri = ?2 OR uri LIKE ?3 ESCAPE '\')",
+        )?;
+        let pattern = format!("{}/%", escape_like(prefix));
+        let rows = stmt.query_map(params![source.as_str(), prefix, pattern], |r| {
+            r.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// 清空水位表与计数器（`hub reset` 用）。索引目录由调用方自行删除。
     pub fn clear(&self) -> Result<()> {
         self.conn
@@ -222,6 +313,21 @@ impl MetaStore {
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
+}
+
+/// 转义 SQL `LIKE` 里的元字符。
+///
+/// 文件路径里 `_` 很常见（`my_file.rs`），在 LIKE 里它是"任意单字符"通配符，
+/// 不转义的话 `C:/a/my_file.rs/%` 会匹配到 `C:/a/myXfile.rs/...`。
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if c == '\\' || c == '%' || c == '_' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]

@@ -4,6 +4,8 @@ members = [
     "crates/hub-core",
     "crates/hub-store",
     "crates/hub-connectors",
+    "crates/hub-engine",
+    "crates/hub-daemon",
     "crates/hub-cli",
 ]
 

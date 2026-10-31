@@ -400,6 +400,8 @@ version = "0.1.0"
 dependencies = [
  "hub-connectors",
  "hub-core",
+ "hub-daemon",
+ "hub-engine",
  "hub-store",
 ]
 
@@ -414,6 +416,28 @@ dependencies = [
 [[package]]
 name = "hub-core"
 version = "0.1.0"
+
+[[package]]
+name = "hub-daemon"
+version = "0.1.0"
+dependencies = [
+ "hub-connectors",
+ "hub-core",
+ "hub-engine",
+ "hub-store",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hub-engine"
+version = "0.1.0"
+dependencies = [
+ "hub-connectors",
+ "hub-core",
+ "hub-store",
+ "tempfile",
+]
 
 [[package]]
 name = "hub-store"

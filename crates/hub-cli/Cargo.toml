@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "hub"
+path = "src/main.rs"
+
 [dependencies]
 hub-core = { path = "../hub-core" }
 hub-store = { path = "../hub-store" }
 hub-connectors = { path = "../hub-connectors" }
+hub-engine = { path = "../hub-engine" }
+hub-daemon = { path = "../hub-daemon" }
