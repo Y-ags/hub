@@ -293,7 +293,9 @@ fn survives_reopen() {
 #[test]
 fn incremental_skip_and_stable_id() {
     let mut fx = Fixture::new();
-    let now = hub_store::indexer::now_secs();
+    // 必须用 fixture 建库时的那个时间戳。重新调 now_secs() 可能在跨秒时
+    // 得到 now+1，于是 mtime 对不上、被判定成"内容变了" —— 测试就随机挂。
+    let now = fx.now;
     let id_before = fx.indexer.meta().lookup(SourceId::Files, "files/1").unwrap().unwrap().doc_id;
 
     let changed = fx
@@ -328,4 +330,90 @@ fn delete_is_visible_immediately() {
     assert!(!after.iter().any(|u| u == uri), "删除后仍能搜到 {uri}: {after:?}");
     let row = fx.indexer.meta().lookup(SourceId::Files, uri).unwrap().unwrap();
     assert!(!row.live);
+}
+
+// ============================================================
+// 段合并（daemon 的空闲维护任务，见 hub-daemon/src/lib.rs）
+// ============================================================
+
+/// 每批写入都是一个新段。段攒起来后合并应该把它们收成 1 个，
+/// 且"没什么可合的时候不白干活"。
+#[test]
+fn merge_collapses_segments() {
+    let dir = TempDir::new().unwrap();
+    let mut ix = Indexer::open(dir.path()).unwrap();
+    for i in 0..6 {
+        assert!(ix
+            .add(
+                SourceId::Files,
+                &format!("files/{i}"),
+                format!("文档 {i}"),
+                format!("正文内容 {i} 凑一点长度让倒排有东西可写"),
+                1_700_000_000 + i,
+            )
+            .unwrap());
+        ix.flush().unwrap();
+    }
+    assert!(ix.segment_count() > 1, "六次独立提交应产生多个段");
+
+    assert!(ix.merge_if_needed(2).unwrap(), "段数超过阈值应该合并");
+    assert_eq!(ix.segment_count(), 1, "合并后应只剩一个段");
+
+    // 已经只有 1 个段、也没有墓碑 → 不该再重写一遍文件
+    assert!(!ix.merge_if_needed(2).unwrap(), "无事可做时不该合并");
+    // 数据没被合并弄丢
+    assert_eq!(ix.meta().count_live().unwrap(), 6);
+    assert_eq!(ix.index().num_docs(), 6);
+}
+
+/// 墓碑是"删了但空间还占着"。阈值没到也必须因为墓碑而合并，
+/// 否则删掉的东西永远占磁盘，而用户不会知道要手动 hub merge。
+#[test]
+fn merge_purges_tombstones_even_below_segment_threshold() {
+    let dir = TempDir::new().unwrap();
+    let mut ix = Indexer::open(dir.path()).unwrap();
+    for i in 0..3 {
+        ix.add(SourceId::Files, &format!("files/{i}"), "标题".into(), format!("内容 {i}"), 1_700_000_000).unwrap();
+    }
+    ix.flush().unwrap();
+    ix.delete(SourceId::Files, "files/0");
+    ix.flush().unwrap();
+    assert_eq!(ix.meta().count_tombstone().unwrap(), 1);
+
+    // 阈值给到 100：段数远远不够，但墓碑必须触发合并
+    assert!(ix.merge_if_needed(100).unwrap(), "有墓碑就该合并");
+    assert_eq!(ix.meta().count_tombstone().unwrap(), 0, "墓碑应被清掉");
+    let pq = ix.parse("内容 0");
+    let hits = ix.search(&pq, 5).unwrap();
+    assert!(!hits.iter().any(|h| h.uri == "files/0"), "删掉的文档不应再出现");
+}
+
+/// 反复修改同一个文件：倒排里必须替换，而不是每次多留一条僵尸。
+///
+/// 这个 bug 的表现极其隐蔽 —— 搜索结果按 doc_id 去重，用户看不出重复；
+/// 只有 `stats` 里"倒排中"远大于"存活"才会露馅，而那时磁盘已经白占了很多。
+#[test]
+fn rewrites_replace_instead_of_appending() {
+    let dir = TempDir::new().unwrap();
+    let mut ix = Indexer::open(dir.path()).unwrap();
+    for i in 0..5 {
+        assert!(ix
+            .add(
+                SourceId::Files,
+                "files/same",
+                "同一篇".into(),
+                format!("第 {i} 版正文 关键词 rewrite"),
+                1_700_000_000 + i,
+            )
+            .unwrap());
+        ix.flush().unwrap();
+    }
+    assert_eq!(ix.meta().count_live().unwrap(), 1);
+    assert_eq!(ix.index().num_docs(), 1, "倒排里应只有一条，而不是五条僵尸");
+
+    let pq = ix.parse("rewrite");
+    let hits = ix.search(&pq, 10).unwrap();
+    assert_eq!(hits.len(), 1, "同一文件不该出现多条命中");
+    // 留下的必须是最后一版：mtime 被更新成了第 5 次写入时给的值
+    assert_eq!(hits[0].mtime, 1_700_000_004, "应该是最后一版");
 }

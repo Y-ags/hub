@@ -170,6 +170,20 @@ impl Engine {
         self.indexer.parse(q)
     }
 
+    /// 段合并 + 墓碑清理。低频操作，只在 daemon 空闲或用户手动 `hub merge` 时调。
+    pub fn merge(&mut self) -> hub_store::Result<()> {
+        self.indexer.merge()
+    }
+
+    /// 按需合并：没有可回收的东西就不动手。返回是否真的合并了。
+    pub fn merge_if_needed(&mut self, min_segments: usize) -> hub_store::Result<bool> {
+        self.indexer.merge_if_needed(min_segments)
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.indexer.segment_count()
+    }
+
     /// 全量遍历所有 roots，只写有变化的。
     ///
     /// 这就是 `hub index` 的实现，也是 daemon 首次启动时的冷启动路径。

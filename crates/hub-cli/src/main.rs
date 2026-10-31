@@ -38,8 +38,12 @@ hub —— 本地离线多源个人检索中枢
   hub reset --yes  清空索引与水位表（破坏性操作）
 
 后台进程:
-  hub daemon start [目录]... [--history] [--fg] [--reconcile 秒] [--debounce 毫秒]
+  hub daemon start [目录]... [--history] [--fg] [--autostart]
+                   [--reconcile 秒] [--debounce 毫秒] [--merge 秒]
         启动后台更新。首次启动会把目录记进配置，之后可省略目录直接 start
+        --autostart 顺带装开机自启，重启电脑后自动接着干
+  hub daemon install   只装开机自启（不启动进程）
+  hub daemon uninstall 取消开机自启
   hub daemon status    看是否在跑、监听了什么、干了多少活
   hub daemon stop [--force]
         优雅停止（写停止标记，等它把攒着的数据写完）；--force 强制结束
@@ -317,48 +321,91 @@ fn cmd_daemon(data: &Path, args: &[String]) -> Result<(), String> {
         "stop" | "down" => daemon_stop(data, rest),
         "status" | "st" => daemon_status(data),
         "log" | "logs" => daemon_log(data, rest),
+        "install" | "autostart" => daemon_install(data),
+        "uninstall" | "no-autostart" => daemon_uninstall(),
         other => Err(format!(
-            "未知 daemon 子命令 `{other}`。可用：start / stop / status / log / run"
+            "未知 daemon 子命令 `{other}`。可用：start / stop / status / log / run / install / uninstall"
         )),
     }
 }
 
-/// 解析 `start` 的参数
-fn parse_start_args(args: &[String]) -> Result<(Vec<PathBuf>, bool, bool, Option<u64>, Option<u64>), String> {
-    let mut roots = Vec::new();
-    let mut history = false;
-    let mut fg = false;
-    let mut reconcile = None;
-    let mut debounce = None;
+/// `hub daemon start` / `run` 的参数。用 struct 而不是元组：
+/// 六个位置参数一旦有一项顺序写错，编译器不会说话。
+#[derive(Default)]
+struct StartArgs {
+    roots: Vec<PathBuf>,
+    history: bool,
+    fg: bool,
+    reconcile: Option<u64>,
+    debounce: Option<u64>,
+    merge: Option<u64>,
+    autostart: bool,
+}
 
+/// 解析 `start` / `run` 的参数
+fn parse_start_args(args: &[String]) -> Result<StartArgs, String> {
+    let mut out = StartArgs::default();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--history" | "-H" => history = true,
-            "--fg" => fg = true,
+            "--history" | "-H" => out.history = true,
+            "--fg" => out.fg = true,
+            "--autostart" => out.autostart = true,
             "--reconcile" => {
-                reconcile = Some(
+                out.reconcile = Some(
                     it.next()
                         .and_then(|v| v.parse().ok())
                         .ok_or_else(|| "--reconcile 需要秒数".to_string())?,
                 );
             }
             "--debounce" => {
-                debounce = Some(
+                out.debounce = Some(
                     it.next()
                         .and_then(|v| v.parse().ok())
                         .ok_or_else(|| "--debounce 需要毫秒数".to_string())?,
                 );
             }
+            "--merge" => {
+                out.merge = Some(
+                    it.next()
+                        .and_then(|v| v.parse().ok())
+                        .ok_or_else(|| "--merge 需要秒数".to_string())?,
+                );
+            }
             _ if a.starts_with("--") => return Err(format!("未知参数 {a}")),
-            _ => roots.push(PathBuf::from(a)),
+            _ => out.roots.push(PathBuf::from(a)),
         }
     }
-    Ok((roots, history, fg, reconcile, debounce))
+    Ok(out)
+}
+
+/// 把命令行参数合并进已有配置。start 和 run 共用，
+/// 免得两边的字段处理慢慢分叉（分叉过一次：run 支持 debounce、start 忘了）。
+fn apply_start_args(cfg: &mut DaemonConfig, a: &StartArgs) {
+    if !a.roots.is_empty() {
+        // 转成绝对路径再存：配置里留着相对路径，下次在别的目录启动就会指错地方
+        cfg.engine.roots = a
+            .roots
+            .iter()
+            .map(|r| std::path::absolute(r).unwrap_or_else(|_| r.clone()))
+            .collect();
+    }
+    if a.history {
+        cfg.engine.with_history = true;
+    }
+    if let Some(v) = a.reconcile {
+        cfg.reconcile_secs = v;
+    }
+    if let Some(v) = a.debounce {
+        cfg.debounce_ms = v;
+    }
+    if let Some(v) = a.merge {
+        cfg.merge_secs = v;
+    }
 }
 
 fn daemon_start(data: &Path, args: &[String]) -> Result<(), String> {
-    let (roots, history, fg, reconcile, debounce) = parse_start_args(args)?;
+    let a = parse_start_args(args)?;
 
     // 已经在跑就别再起一个：两个进程同时写同一个索引，Tantivy 的写入器锁
     // 会互相阻塞，最后变成两个都在等对方
@@ -373,22 +420,7 @@ fn daemon_start(data: &Path, args: &[String]) -> Result<(), String> {
 
     // 目录：本次给了就覆盖，没给就沿用上次的配置
     let mut cfg = DaemonConfig::load(data).map_err(|e| format!("读取配置失败：{e}"))?;
-    if !roots.is_empty() {
-        // 转成绝对路径再存：配置里留着相对路径，下次在别的目录启动就会指错地方
-        cfg.engine.roots = roots
-            .iter()
-            .map(|r| std::path::absolute(r).unwrap_or_else(|_| r.clone()))
-            .collect();
-    }
-    if history {
-        cfg.engine.with_history = true;
-    }
-    if let Some(v) = reconcile {
-        cfg.reconcile_secs = v;
-    }
-    if let Some(v) = debounce {
-        cfg.debounce_ms = v;
-    }
+    apply_start_args(&mut cfg, &a);
 
     if cfg.engine.roots.is_empty() {
         return Err(
@@ -405,7 +437,7 @@ fn daemon_start(data: &Path, args: &[String]) -> Result<(), String> {
 
     cfg.save(data).map_err(|e| format!("写配置失败：{e}"))?;
 
-    if fg {
+    if a.fg {
         return daemon_run(data, &[]);
     }
 
@@ -434,6 +466,18 @@ fn daemon_start(data: &Path, args: &[String]) -> Result<(), String> {
         println!("\n之后改了文件会自动进索引，不需要再手动 index。");
         println!("日志：{}", data.join("daemon.log").display());
         println!("查看状态：hub daemon status    停止：hub daemon stop");
+
+        if a.autostart {
+            match hub_daemon::autostart::install(data) {
+                Ok(cmd) => {
+                    println!("\n已设置开机自启，重启后会自动继续：");
+                    println!("  {cmd}");
+                }
+                Err(e) => eprintln!("\n开机自启设置失败：{e}"),
+            }
+        } else if !hub_daemon::autostart::is_enabled() {
+            println!("\n提示：这条命令只在本次开机内有效。想重启后自动接着干，加 --autostart。");
+        }
         Ok(())
     } else {
         Err(format!(
@@ -446,23 +490,9 @@ fn daemon_start(data: &Path, args: &[String]) -> Result<(), String> {
 }
 
 fn daemon_run(data: &Path, args: &[String]) -> Result<(), String> {
-    let (roots, history, _, reconcile, debounce) = parse_start_args(args)?;
+    let a = parse_start_args(args)?;
     let mut cfg = DaemonConfig::load(data).map_err(|e| format!("读取配置失败：{e}"))?;
-    if !roots.is_empty() {
-        cfg.engine.roots = roots
-            .iter()
-            .map(|r| std::path::absolute(r).unwrap_or_else(|_| r.clone()))
-            .collect();
-    }
-    if history {
-        cfg.engine.with_history = true;
-    }
-    if let Some(v) = reconcile {
-        cfg.reconcile_secs = v;
-    }
-    if let Some(v) = debounce {
-        cfg.debounce_ms = v;
-    }
+    apply_start_args(&mut cfg, &a);
     if cfg.engine.roots.is_empty() {
         return Err("没有要监听的目录。用法：hub daemon run <目录>...".into());
     }
@@ -472,6 +502,37 @@ fn daemon_run(data: &Path, args: &[String]) -> Result<(), String> {
 
     let d = Daemon::new(data, cfg, true).map_err(|e| e.to_string())?;
     d.run()
+}
+
+/// 只装开机自启，不启动进程。
+///
+/// 会先确认配置里确实有监听目录：没有的话登录时 `daemon run` 会立刻报错退出，
+/// 用户看到的就是"设了自启但什么都没发生"，比不设更糟。
+fn daemon_install(data: &Path) -> Result<(), String> {
+    let cfg = DaemonConfig::load(data).map_err(|e| format!("读取配置失败：{e}"))?;
+    if cfg.engine.roots.is_empty() {
+        return Err(
+            "还没有配置要监听的目录。先运行一次：\n  hub daemon start <目录>...\n\
+             再回来装自启（或者直接 hub daemon start <目录> --autostart）"
+                .into(),
+        );
+    }
+    if hub_daemon::autostart::is_enabled() {
+        println!("开机自启已经开着。要改指向，直接重跑 install 会覆盖。");
+    }
+    let cmd = hub_daemon::autostart::install(data)?;
+    println!("已设置开机自启（当前用户，登录时启动），不需要管理员权限。");
+    println!("  命令：{cmd}");
+    println!("  位置：HKEY_CURRENT_USER\\{}", hub_daemon::autostart::RUN_KEY);
+    println!("\n取消：hub daemon uninstall");
+    println!("也可以在任务管理器「启动」标签里临时禁用，不用删。");
+    Ok(())
+}
+
+fn daemon_uninstall() -> Result<(), String> {
+    hub_daemon::autostart::uninstall()?;
+    println!("已取消开机自启。当前正在运行的守护进程不受影响（hub daemon stop 可停它）。");
+    Ok(())
 }
 
 fn daemon_stop(data: &Path, args: &[String]) -> Result<(), String> {
@@ -533,10 +594,15 @@ fn daemon_stop(data: &Path, args: &[String]) -> Result<(), String> {
 }
 
 fn daemon_status(data: &Path) -> Result<(), String> {
+    // 自启状态先打：它解释的是"为什么现在没在跑 / 为什么重启后还会跑"，
+    // 而下面那几行只有进程跑过才有内容
+    let autostart = hub_daemon::autostart::enabled();
+
     let (st, _) = match hub_daemon::describe_state(data) {
         Some(x) => x,
         None => {
             println!("守护进程：未运行（没有状态文件）");
+            print_autostart(&autostart);
             println!("启动：hub daemon start <目录>");
             return Ok(());
         }
@@ -593,8 +659,28 @@ fn daemon_status(data: &Path) -> Result<(), String> {
         "累计写入：{} 条    删除：{} 条",
         st.indexed_total, st.deleted_total
     );
+    if st.segments > 0 || st.merge_runs > 0 {
+        println!(
+            "索引段：{} 个    最近合并：{}（共 {} 次）",
+            st.segments,
+            if st.last_merge_at > 0 {
+                hub_daemon::human_time(st.last_merge_at)
+            } else {
+                "（还没合并过）".into()
+            },
+            st.merge_runs
+        );
+    }
+    print_autostart(&autostart);
     println!("日志：{}", data.join("daemon.log").display());
     Ok(())
+}
+
+fn print_autostart(saved: &Option<String>) {
+    match saved {
+        Some(cmd) => println!("开机自启：已开启    {cmd}"),
+        None => println!("开机自启：未开启（hub daemon install 可开启）"),
+    }
 }
 
 fn daemon_log(data: &Path, args: &[String]) -> Result<(), String> {

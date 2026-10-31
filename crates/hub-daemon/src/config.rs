@@ -26,12 +26,36 @@ pub const DEFAULT_HEARTBEAT_SECS: u64 = 15;
 /// 心跳超过这个时长没更新，就认为进程已死
 pub const HEARTBEAT_STALE_SECS: i64 = 90;
 
+/// 段合并的检查周期。默认 3 小时。
+///
+/// 每批写入都会新开一个段，段太多会让每次查询变慢（要逐段打分）；
+/// 删掉的文档也只是打了墓碑标记，空间不合并就永远占着。
+/// 但合并不是免费的（重写段文件），所以拉长到小时级，只在空闲时做。
+pub const DEFAULT_MERGE_SECS: u64 = 3 * 3600;
+
+/// 距上次文件变更至少静默这么久，才允许合并。
+///
+/// 合并会短暂独占写入器；正在连续编辑时切进去，会让"改完 1 秒内能搜到"
+/// 这个体验直接失效。默认 2 分钟。
+pub const DEFAULT_MERGE_IDLE_SECS: u64 = 120;
+
+/// 段数达到这个值才因为"段太多"而合并。
+///
+/// 只有 1–2 个段时合并纯属重写一遍文件，没有任何收益。
+pub const DEFAULT_MERGE_MIN_SEGMENTS: usize = 8;
+
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     pub engine: EngineConfig,
     pub debounce_ms: u64,
     pub reconcile_secs: u64,
     pub heartbeat_secs: u64,
+    /// 多久检查一次"要不要合并段"
+    pub merge_secs: u64,
+    /// 距上次变更静默多久才允许合并
+    pub merge_idle_secs: u64,
+    /// 段数达到多少才因为段多而合并
+    pub merge_min_segments: usize,
 }
 
 impl Default for DaemonConfig {
@@ -41,6 +65,9 @@ impl Default for DaemonConfig {
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             reconcile_secs: DEFAULT_RECONCILE_SECS,
             heartbeat_secs: DEFAULT_HEARTBEAT_SECS,
+            merge_secs: DEFAULT_MERGE_SECS,
+            merge_idle_secs: DEFAULT_MERGE_IDLE_SECS,
+            merge_min_segments: DEFAULT_MERGE_MIN_SEGMENTS,
         }
     }
 }
@@ -105,6 +132,21 @@ impl DaemonConfig {
                         cfg.heartbeat_secs = n;
                     }
                 }
+                "merge_secs" => {
+                    if let Ok(n) = v.parse() {
+                        cfg.merge_secs = n;
+                    }
+                }
+                "merge_idle_secs" => {
+                    if let Ok(n) = v.parse() {
+                        cfg.merge_idle_secs = n;
+                    }
+                }
+                "merge_min_segments" => {
+                    if let Ok(n) = v.parse() {
+                        cfg.merge_min_segments = n;
+                    }
+                }
                 _ => {}
             }
         }
@@ -114,6 +156,12 @@ impl DaemonConfig {
         }
         if cfg.reconcile_secs == 0 {
             cfg.reconcile_secs = DEFAULT_RECONCILE_SECS;
+        }
+        if cfg.merge_secs == 0 {
+            cfg.merge_secs = DEFAULT_MERGE_SECS;
+        }
+        if cfg.merge_min_segments == 0 {
+            cfg.merge_min_segments = DEFAULT_MERGE_MIN_SEGMENTS;
         }
         cfg
     }
@@ -131,6 +179,9 @@ impl DaemonConfig {
         s.push_str(&format!("debounce_ms={}\n", self.debounce_ms));
         s.push_str(&format!("reconcile_secs={}\n", self.reconcile_secs));
         s.push_str(&format!("heartbeat_secs={}\n", self.heartbeat_secs));
+        s.push_str(&format!("merge_secs={}\n", self.merge_secs));
+        s.push_str(&format!("merge_idle_secs={}\n", self.merge_idle_secs));
+        s.push_str(&format!("merge_min_segments={}\n", self.merge_min_segments));
         std::fs::write(Self::conf_path(data), s)
     }
 }
@@ -159,9 +210,29 @@ mod tests {
     #[test]
     fn zero_values_fall_back_to_defaults() {
         // 把 debounce 写成 0 会让主循环空转，必须兜住
-        let cfg = DaemonConfig::parse("debounce_ms=0\nreconcile_secs=0\n");
+        let cfg = DaemonConfig::parse("debounce_ms=0\nreconcile_secs=0\nmerge_secs=0\nmerge_min_segments=0\n");
         assert_eq!(cfg.debounce_ms, DEFAULT_DEBOUNCE_MS);
         assert_eq!(cfg.reconcile_secs, DEFAULT_RECONCILE_SECS);
+        assert_eq!(cfg.merge_secs, DEFAULT_MERGE_SECS);
+        assert_eq!(cfg.merge_min_segments, DEFAULT_MERGE_MIN_SEGMENTS);
+        // merge_idle_secs 允许是 0：那是"随时可合并"，是合法配置而不是笔误
+        assert_eq!(cfg.merge_idle_secs, DEFAULT_MERGE_IDLE_SECS);
+    }
+
+    #[test]
+    fn merge_settings_survive_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = DaemonConfig::default();
+        cfg.engine.roots = vec![PathBuf::from("C:/x")];
+        cfg.merge_secs = 7200;
+        cfg.merge_idle_secs = 0;
+        cfg.merge_min_segments = 3;
+        cfg.save(tmp.path()).unwrap();
+
+        let back = DaemonConfig::load(tmp.path()).unwrap();
+        assert_eq!(back.merge_secs, 7200);
+        assert_eq!(back.merge_idle_secs, 0, "0 是合法值，不能被兜回默认");
+        assert_eq!(back.merge_min_segments, 3);
     }
 
     #[test]

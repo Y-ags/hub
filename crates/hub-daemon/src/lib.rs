@@ -33,6 +33,7 @@
 //! 那个 500ms 上限是为了让 `hub daemon stop` 能在半秒内生效 ——
 //! 否则一个"等 10 分钟对账"的阻塞调用会让停止操作卡住。
 
+pub mod autostart;
 pub mod config;
 pub mod log;
 pub mod process;
@@ -158,12 +159,31 @@ impl Daemon {
         let debounce = Duration::from_millis(self.cfg.debounce_ms.max(50));
         let reconcile_every = Duration::from_secs(self.cfg.reconcile_secs.max(5));
         let heartbeat_every = Duration::from_secs(self.cfg.heartbeat_secs.max(1));
+        let merge_every = Duration::from_secs(self.cfg.merge_secs.max(5));
+        let merge_idle = Duration::from_secs(self.cfg.merge_idle_secs);
 
         let mut pending: BTreeSet<PathBuf> = BTreeSet::new();
         let mut buf: Vec<FsEvent> = Vec::new();
         let mut last_evt = Instant::now();
         let mut next_reconcile = Instant::now() + reconcile_every;
         let mut next_heartbeat = Instant::now() + heartbeat_every;
+        // 冷启动刚扫完，段可能已经积了一堆（旧版本留下的，或者停机期间攒的）。
+        // 这种一次性的堆积不该再等一个完整周期，给它 15 秒就收拾掉。
+        self.state.segments = self.engine.segment_count();
+        let backlogged = self.state.segments > self.cfg.merge_min_segments * 2;
+        let mut next_merge = Instant::now()
+            + if backlogged {
+                Duration::from_secs(15)
+            } else {
+                merge_every
+            };
+        let _ = self.state.save(&self.data);
+        if backlogged {
+            self.log.info(format!(
+                "索引有 {} 个段（阈值 {}），15 秒后做一次合并",
+                self.state.segments, self.cfg.merge_min_segments
+            ));
+        }
         let mut force_reconcile = false;
 
         loop {
@@ -234,7 +254,49 @@ impl Daemon {
                 }
             }
 
-            // ---- 5. 心跳 ----
+            // ---- 5. 空闲时合并段 ----
+            //
+            // 为什么必须做：每批写入都是一个新段，删掉的文档只是墓碑。
+            // 不合并的话，段数会随编辑次数线性增长，查询要逐段打分越来越慢，
+            // 而删掉的文件还一直占着磁盘。
+            //
+            // 为什么不能随时做：合并要独占写入器并重写段文件，
+            // 撞上正在保存的文件会让"改完立刻能搜到"失效。所以只在
+            // 距上次变更静默 merge_idle 之后动手。
+            let merge_now = Instant::now();
+            if merge_now >= next_merge {
+                let idle = pending.is_empty() && merge_now.duration_since(last_evt) >= merge_idle;
+                // 到点之后最多再等一个完整周期。没有这条兜底，"用户一直在编辑"
+                // 就等于"永远不合并" —— 而连续编辑几小时恰恰是最需要合并的场景。
+                // 超时后硬合并的代价只是这一瞬间的写入要等写入器锁，不会丢数据。
+                let overdue = merge_now.duration_since(next_merge) >= merge_every;
+                if idle || overdue {
+                    next_merge = merge_now + merge_every;
+                    self.state.segments = self.engine.segment_count();
+                    match self.engine.merge_if_needed(self.cfg.merge_min_segments) {
+                        Ok(true) => {
+                            self.state.last_merge_at = now_secs();
+                            self.state.merge_runs += 1;
+                            self.state.segments = self.engine.segment_count();
+                            self.log.info(format!(
+                                "段合并完成{}：{} 个段，累计第 {} 次",
+                                if overdue && !idle { "（排队太久，强行合并）" } else { "" },
+                                self.state.segments,
+                                self.state.merge_runs
+                            ));
+                            let _ = self.state.save(&self.data);
+                        }
+                        // 没什么可合的。不刷日志：这条每 3 小时一次，
+                        // 刷出来只会让日志里全是"无事发生"
+                        Ok(false) => {}
+                        Err(e) => self.log.error(format!("段合并失败：{e}")),
+                    }
+                }
+                // 不空闲就什么都不动，下一个 tick 再看 —— 判断成本只是两个
+                // 内存比较，比"推迟 5 分钟"精确得多（推迟会整整错过一个空窗）
+            }
+
+            // ---- 6. 心跳 ----
             let now = Instant::now();
             if now >= next_heartbeat {
                 next_heartbeat = now + heartbeat_every;

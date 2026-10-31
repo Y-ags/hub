@@ -26,6 +26,11 @@ pub struct State {
     pub indexed_total: usize,
     pub deleted_total: usize,
     pub reconcile_runs: usize,
+    /// 上次段合并的时间与次数
+    pub last_merge_at: i64,
+    pub merge_runs: usize,
+    /// 最近一次观测到的索引段数（不合并也更新，用来判断"该不该合"）
+    pub segments: usize,
     /// 主循环轮次，用来判断进程是"活着但卡住"还是"根本没在跑"
     pub ticks: u64,
     pub roots: Vec<String>,
@@ -87,7 +92,8 @@ impl State {
         format!(
             "pid={}\nstarted_at={}\nheartbeat_at={}\nlast_event_at={}\n\
              last_reconcile_at={}\nindexed_total={}\ndeleted_total={}\n\
-             reconcile_runs={}\nticks={}\nroots={}\n",
+             reconcile_runs={}\nlast_merge_at={}\nmerge_runs={}\nsegments={}\n\
+             ticks={}\nroots={}\n",
             self.pid,
             self.started_at,
             self.heartbeat_at,
@@ -96,6 +102,9 @@ impl State {
             self.indexed_total,
             self.deleted_total,
             self.reconcile_runs,
+            self.last_merge_at,
+            self.merge_runs,
+            self.segments,
             self.ticks,
             roots
         )
@@ -116,6 +125,9 @@ impl State {
                 "indexed_total" => s.indexed_total = v.trim().parse().unwrap_or(0),
                 "deleted_total" => s.deleted_total = v.trim().parse().unwrap_or(0),
                 "reconcile_runs" => s.reconcile_runs = v.trim().parse().unwrap_or(0),
+                "last_merge_at" => s.last_merge_at = v.trim().parse().unwrap_or(0),
+                "merge_runs" => s.merge_runs = v.trim().parse().unwrap_or(0),
+                "segments" => s.segments = v.trim().parse().unwrap_or(0),
                 "ticks" => s.ticks = v.trim().parse().unwrap_or(0),
                 "roots" => {
                     s.roots = v
@@ -231,6 +243,9 @@ mod tests {
             indexed_total: 99,
             deleted_total: 3,
             reconcile_runs: 2,
+            last_merge_at: 1_700_000_020,
+            merge_runs: 1,
+            segments: 6,
             ticks: 17,
             roots: vec!["C:/code".into(), "C:/notes".into()],
             ..Default::default()
@@ -239,6 +254,9 @@ mod tests {
         assert_eq!(back.pid, 4242);
         assert_eq!(back.indexed_total, 99);
         assert_eq!(back.reconcile_runs, 2);
+        assert_eq!(back.last_merge_at, 1_700_000_020);
+        assert_eq!(back.merge_runs, 1);
+        assert_eq!(back.segments, 6);
         assert_eq!(back.roots, vec!["C:/code", "C:/notes"]);
     }
 

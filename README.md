@@ -4,11 +4,12 @@
 用一句话搜到任何东西。**全部本地、离线、不上传。**
 
 ```bash
-hub daemon start ~/code ~/notes --history   # 起一次，之后不用再管
+hub daemon start ~/code ~/notes --history --autostart   # 起一次，重启电脑也还在
 hub search 上个月写的那个rust内存相关的代码片段
 ```
 
 起了 daemon 之后，**改文件不用敲任何命令**，一秒后就能搜到新内容。
+加了 `--autostart` 就再也不需要管它了：登录 Windows 自动拉起，索引段自己合并。
 
 ---
 
@@ -16,16 +17,23 @@ hub search 上个月写的那个rust内存相关的代码片段
 
 ```bash
 cargo build --release          # 首次约 2–5 分钟（Tantivy + bundled SQLite）
-cargo test                     # 80 条测试，全部离线可跑
+cargo test                     # 86 条测试，全部离线可跑
 
-./target/release/hub daemon start ~/code ~/notes --history   # 后台自动更新
+./target/release/hub daemon start ~/code ~/notes --history --autostart  # 一步到位
 ./target/release/hub daemon status                            # 看它在干什么
 ./target/release/hub search "零拷贝 mmap" --limit 5
 ./target/release/hub daemon log -n 20                         # 后台日志
-./target/release/hub daemon stop                              # 优雅停止
+./target/release/hub daemon stop                              # 优雅停止（不影响开机自启）
 ```
 
 目录会记进配置，第二次直接 `hub daemon start` 即可。
+
+不想一开始就装自启，可以事后单独装：
+
+```bash
+./target/release/hub daemon install     # 只装开机自启，不启动
+./target/release/hub daemon uninstall   # 取消
+```
 
 不想常驻也能手动索引（增量，内容没变的直接跳过）：
 
@@ -40,8 +48,8 @@ cargo test                     # 80 条测试，全部离线可跑
 ~/.hub/
 ├── meta.sqlite      水位表：content_hash / mtime / tombstone / doc_id（事实源）
 ├── index/           Tantivy 倒排（可重建，删了不心疼）
-├── daemon.conf      监听哪些目录、debounce / 对账间隔
-├── daemon.state     pid / 心跳 / 累计统计
+├── daemon.conf      监听哪些目录、debounce / 对账 / 合并间隔
+├── daemon.state     pid / 心跳 / 段数 / 累计统计
 └── daemon.log       后台日志（5MB 滚动）
 ```
 
@@ -70,7 +78,36 @@ cargo test                     # 80 条测试，全部离线可跑
 只有 watcher 不够：`ReadDirectoryChangesW` 在事件多于缓冲区时**静默丢事件并返回 0 字节**。
 只有周期对账也不够：延迟不可接受。
 
-可调参数：`hub daemon start --reconcile 300 --debounce 500`，或直接改 `daemon.conf`。
+可调参数：`hub daemon start --reconcile 300 --debounce 500 --merge 7200`，或直接改 `daemon.conf`。
+
+### 空闲时自动合并段
+
+每批写入都是一个新索引段，删掉的文件只是打个墓碑。不合并的话：
+
+- 段数随编辑次数线性增长，每次查询都要**逐段打分**，越用越慢
+- 删除的文档一直占着磁盘，"删了但空间没回来"
+
+daemon 每 3 小时（`merge_secs`）检查一次，在**距上次文件变更静默 2 分钟**之后动手，
+免得合并抢占写入器、把"改完一秒能搜到"拖慢。到点但用户一直在编辑时最多再等一个周期，
+超时就强行合并 —— 否则"连续工作一整天"就等于"永远不合并"。
+
+判断依据是"段数 ≥ 8"或"有墓碑"，都没有就什么都不做（不会为了合并而重写文件）。
+
+### 开机自启
+
+```bash
+hub daemon start ~/code --autostart   # 启动 + 装自启
+hub daemon install                    # 只装自启
+hub daemon uninstall                  # 取消
+```
+
+写在 `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`，值名 `HubDaemon`：
+
+- **不需要管理员权限**（HKCU 而非 HKLM），个人工具没有理由要 UAC
+- 在任务管理器「启动」标签里能看到，也能临时禁用而不删
+- `hub daemon status` 会显示当前自启命令，方便核对指向哪个路径
+
+`daemon stop` 只是停进程，**不会**关掉自启 —— 那正是"下次开机还要自动起来"的意思。
 
 ---
 
@@ -78,7 +115,7 @@ cargo test                     # 80 条测试，全部离线可跑
 
 ```
 hub-cli         参数 / IO / 打印，不含检索逻辑也不含采集逻辑
-hub-daemon      常驻进程：watcher + debounce + 周期对账 + 状态文件
+hub-daemon      常驻进程：watcher + debounce + 对账 + 空闲合并 + 自启 + 状态文件
 hub-engine      采集流水线（scan_all / index_paths / remove_paths / reconcile）
 hub-store       MetaStore(SQLite) + HubIndex(Tantivy) + Indexer(胶水)
 hub-core        查询解析 / 中文分词 / BM25 / tombstone（零依赖）
@@ -135,6 +172,7 @@ hub-connectors  files / terminal 采集器（零依赖）
 | 索引用 jieba、查询用自研词典 | term 对不上，静默搜不到。必须同源 |
 | 给 source 加 `Must` 过滤就行 | **错**。外层有 `Must` 时 `Should` 变可选，同来源文档 0 分混入结果 |
 | "十" 可以跳过 | `cn_digit('十')` 是 `None`，收集循环会在"十"处断开：`十二个月前`→2 个月 |
+| 改文件时直接 `add_document` 就是"更新" | **错**。Tantivy 没有 upsert，旧文档变成僵尸：搜索结果按 doc_id 去重把它藏起来，`stats` 里"倒排中"才会露馅（实测 15 vs 存活 6）。写入前必须先 `delete_term(uri)` |
 
 ### 文件监听（`ReadDirectoryChangesW`）
 
@@ -153,6 +191,7 @@ hub-connectors  files / terminal 采集器（零依赖）
 
 - **没有图形界面**：只有 CLI
 - **没有截图 OCR、聊天记录 connector**
+- **开机自启只实现了 Windows**（HKCU Run 键）；Linux / macOS 需自己配 systemd unit / launchd
 - **非 UTF-8 文件直接跳过**（GBK 会变乱码，宁可漏不要脏）
 - **重排窗口 2000**：时间/来源惩罚在 BM25 之后做，超出窗口的文档不参与重排
 - **Windows 上索引目录被占用时删不掉**：`hub reset` 需要先 `hub daemon stop`

@@ -294,6 +294,15 @@ impl HubIndex {
         self.reader.searcher().num_docs() as usize
     }
 
+    /// 当前可检索的段数量。
+    ///
+    /// daemon 用它决定"要不要合并"：每批写入都会产生一个新段，
+    /// 段数涨到几十上百时，每次查询都要逐个段打分，延迟成倍上升。
+    /// 已经只有一个段时再合并纯属白烧 IO。
+    pub fn segment_count(&self) -> usize {
+        self.reader.searcher().segment_readers().len()
+    }
+
     /// 手动触发段合并以回收已删文档的空间。合并是后台任务，这里等它结束。
     pub fn merge_all(&self, writer: &mut IndexWriter) -> Result<()> {
         let ids = self.index.searchable_segment_ids()?;

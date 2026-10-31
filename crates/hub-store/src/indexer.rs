@@ -224,6 +224,12 @@ impl Indexer {
             }
         }
         for d in &docs {
+            // 更新同一个 uri 必须先删掉旧文档。Tantivy 没有 upsert 语义：
+            // 直接 add 会往段里再塞一条，旧的那条从此变成搜得到、但水位表里
+            // 已经不存在的僵尸 —— 搜索结果按 doc_id 去重会把它藏起来，
+            // 于是磁盘上白占一份、查询多扫一段，没人看得出来。
+            // delete_term 只作用于本次 add 之前的文档，所以"先删后加"是对的。
+            self.index.delete_doc(&writer, &d.uri)?;
             self.index.add_doc(&writer, d)?;
             self.meta.upsert(d, now)?;
         }
@@ -266,6 +272,26 @@ impl Indexer {
             self.meta.purge(&source, &uri)?;
         }
         Ok(())
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.index.segment_count()
+    }
+
+    /// 空闲维护用的"按需合并"：没有可回收的东西就什么都不做。
+    ///
+    /// `merge()` 无条件建写入器 —— 那会占用内存预算并短暂锁住索引目录。
+    /// daemon 每轮都调它显然不行，所以这里先判断两个真正触发合并的条件：
+    /// 段数已经积起来了，或者有墓碑占着倒排里的空间。
+    /// 返回 `true` 表示真的合并了。
+    pub fn merge_if_needed(&mut self, min_segments: usize) -> Result<bool> {
+        let segs = self.index.segment_count();
+        let tombs = self.meta.count_tombstone()?;
+        if segs < min_segments.max(2) && tombs == 0 {
+            return Ok(false);
+        }
+        self.merge()?;
+        Ok(true)
     }
 }
 
