@@ -50,6 +50,13 @@ impl Log {
     }
 
     fn write(&mut self, level: &str, msg: &str) {
+        // 一条日志必须是**一行**。
+        //
+        // 有些消息本来就带换行（比如写租约超时那句：先说谁在写、再说怎么办），
+        // 直接写进文件会变成几条没有时间戳、没有级别的裸行，
+        // `grep ERROR` 抓不到，看起来像日志坏了。这里把换行压成 `⏎`，
+        // 既保住一行一条，又不吞掉信息。
+        let msg = msg.replace('\n', " ⏎ ");
         let line = format!("{} [{}] {}\n", fmt_time(now()), level, msg);
         if self.echo {
             // 前台模式下 stderr 用于日志，stdout 留给可能的结构化输出
@@ -94,4 +101,31 @@ fn now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiline_message_stays_on_one_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        let mut log = Log::open(path.clone(), false);
+        // 写租约超时那句话本来是三行（谁在写 / 怎么办 / 怎么调）
+        log.info("第一行\n第二行\n第三行");
+        log.error("只有一行");
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2, "两条日志就该是两行：{text}");
+        assert!(text.contains("第一行 ⏎ 第二行 ⏎ 第三行"), "换行被压成了分隔符：{text}");
+        assert!(text.lines().all(|l| l.contains('[')), "每一行都得能看出级别：{text}");
+    }
+
+    #[test]
+    fn silent_log_swallows_everything() {
+        let mut log = Log::silent();
+        log.info("没有落盘，也不该 panic");
+        assert!(log.path.as_os_str().is_empty());
+    }
 }

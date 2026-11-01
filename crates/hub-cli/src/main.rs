@@ -36,7 +36,11 @@ hub —— 本地离线多源个人检索中枢
         手动全量扫描（daemon 在跑时通常不需要）
   hub stats        查看索引规模与来源分布（daemon 在跑时问它，数字是实时的）
   hub merge        回收已删文档占用的倒排空间
-  hub reset --yes  清空索引与水位表（破坏性操作）
+  hub reset --yes  清空索引与水位表（破坏性操作；要求 daemon 已停）
+
+  这三个都是**写者**。daemon 也是写者，同一时刻只允许一个写者：
+  谁先拿到写租约谁写，另一个排队等（默认最多 30 秒，HUB_WRITE_WAIT_SECS 可调）。
+  所以 hub index 和 daemon 同时跑是安全的，只是双方会互相让一下。
 
 后台进程:
   hub daemon start [目录]... [--history] [--fg] [--autostart]
@@ -167,10 +171,17 @@ fn cmd_index(data: &Path, args: &[String]) -> Result<(), String> {
         return Err("没有指定扫描路径。用法：hub index <目录> [--history]".into());
     }
 
-    // reset 必须先于 open：Windows 上被 mmap 的段文件删不掉
+    // reset 必须先于 open：Windows 上被 mmap 的段文件删不掉。
+    // 但"被 daemon mmap 着"就不只是删不掉，硬来会在半路失败并留下半个索引 ——
+    // 所以这里先要求 daemon 停掉，而不是让用户在"拒绝访问"里猜原因。
     if reset {
+        ensure_daemon_stopped(data)?;
+        announce_writer_wait(data, "清空");
         Indexer::reset(data).map_err(|e| format!("清空索引失败：{e}"))?;
         println!("已清空 {}", data.display());
+    } else {
+        announce_writer_wait(data, "扫描");
+        announce_daemon_sharing(data);
     }
 
     let cfg = EngineConfig {
@@ -1032,6 +1043,7 @@ fn print_sources(by_source: &[(String, usize)]) {
 
 fn cmd_merge(data: &Path) -> Result<(), String> {
     let started = Instant::now();
+    announce_writer_wait(data, "合并");
     let mut indexer = Indexer::open(data).map_err(|e| format!("打开数据目录失败：{e}"))?;
     indexer.merge().map_err(|e| format!("合并失败：{e}"))?;
     let (live, tombs, docs, _) = indexer.stats().map_err(|e| e.to_string())?;
@@ -1042,6 +1054,51 @@ fn cmd_merge(data: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 写在索引里的三个动作（index / merge / reset）共用的一套前置检查。
+///
+/// 放在一起是为了**口径一致**：以前 `index` 会提示"daemon 在跑"、`merge` 一声不响、
+/// `reset` 直接撞上"拒绝访问" —— 同一类问题三种表现，用户只能猜。
+fn announce_writer_wait(data: &Path, what: &str) {
+    if let Some(h) = hub_store::lease::peek(data) {
+        println!(
+            "另一个写者正在写索引（{}）。{what}会等这一批写完再开始，\
+             最多等 {} 秒（{} 可调，单位秒）。",
+            h.describe(),
+            hub_store::lease::default_wait().as_secs(),
+            hub_store::lease::ENV_WAIT_SECS
+        );
+    }
+}
+
+fn announce_daemon_sharing(data: &Path) {
+    if let Some(st) = hub_daemon::State::load(data) {
+        if st.is_alive() {
+            println!(
+                "提示：daemon 在运行（pid {}）。它是另一个写者，两边按批排队 —— \
+                 不会再互相撞锁，只是它这几秒的入库会稍微延后。",
+                st.pid
+            );
+        }
+    }
+}
+
+/// `reset` 的前置条件：daemon 必须停。
+///
+/// 不是"建议"，是硬性要求：daemon 用 mmap 拿着段文件，Windows 上这些文件
+/// 删不掉；硬来只会在删到一半时失败，留下一个既不是新索引也不是旧索引的目录。
+fn ensure_daemon_stopped(data: &Path) -> Result<(), String> {
+    if let Some(st) = hub_daemon::State::load(data) {
+        if st.is_alive() {
+            return Err(format!(
+                "daemon 正在运行（pid {}），它 mmap 着索引段文件 —— \
+                 现在删会半路失败。\n先执行 hub daemon stop，再重试。",
+                st.pid
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn cmd_reset(data: &Path, args: &[String]) -> Result<(), String> {
     if !args.iter().any(|a| a == "--yes") {
         return Err(format!(
@@ -1049,6 +1106,8 @@ fn cmd_reset(data: &Path, args: &[String]) -> Result<(), String> {
             data.display()
         ));
     }
+    ensure_daemon_stopped(data)?;
+    announce_writer_wait(data, "清空");
     Indexer::reset(data).map_err(|e| format!("清空失败：{e}"))?;
     println!("已清空 {}", data.display());
     Ok(())

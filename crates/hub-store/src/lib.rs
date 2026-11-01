@@ -19,12 +19,14 @@
 
 pub mod index;
 pub mod indexer;
+pub mod lease;
 pub mod meta;
 
 use std::fmt;
 
 pub use index::{Hit, HubIndex, HUB_BIGRAM, HUB_WORD};
 pub use indexer::{meta_path, Indexer, IndexerStats, META_FILE};
+pub use lease::{LeaseHolder, WriteLease};
 pub use meta::{MetaRow, MetaStore};
 
 /// 存储层统一错误。混用 tantivy::Result 和 rusqlite::Result 会让上层写出一堆
@@ -36,6 +38,11 @@ pub enum StoreError {
     Tantivy(tantivy::TantivyError),
     /// 目录 / schema 这类需要人类可读解释的错误
     Message(String),
+    /// 等写租约超时：另一个进程正在写同一份索引。
+    ///
+    /// 单独一个变体（而不是塞进 `Message`）是为了让**上层能分辨**：
+    /// daemon 撞上它是"稍后再试、别丢批"，用户命令撞上它是"该报错给个说法"。
+    Busy(String),
 }
 
 impl fmt::Display for StoreError {
@@ -45,7 +52,15 @@ impl fmt::Display for StoreError {
             StoreError::Sql(e) => write!(f, "sqlite: {e}"),
             StoreError::Tantivy(e) => write!(f, "tantivy: {e}"),
             StoreError::Message(m) => write!(f, "{m}"),
+            StoreError::Busy(m) => write!(f, "{m}"),
         }
+    }
+}
+
+impl StoreError {
+    /// 是不是"现在写不了，但过一会儿就行"。
+    pub fn is_busy(&self) -> bool {
+        matches!(self, StoreError::Busy(_))
     }
 }
 
@@ -56,6 +71,7 @@ impl std::error::Error for StoreError {
             StoreError::Sql(e) => Some(e),
             StoreError::Tantivy(e) => Some(e),
             StoreError::Message(_) => None,
+            StoreError::Busy(_) => None,
         }
     }
 }

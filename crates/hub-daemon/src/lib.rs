@@ -80,8 +80,18 @@ impl Daemon {
     pub fn new(data: impl AsRef<Path>, cfg: DaemonConfig, echo: bool) -> Result<Self, String> {
         let data = data.as_ref().to_path_buf();
         std::fs::create_dir_all(&data).map_err(|e| format!("创建数据目录失败：{e}"))?;
-        let engine =
+        let mut engine =
             Engine::open(&data, cfg.engine.clone()).map_err(|e| format!("打开索引失败：{e}"))?;
+        // daemon **不等**写租约。
+        //
+        // 它是后台线程：为了等一个正在跑的 `hub index`（可能几分钟）而把主循环
+        // 挂住，代价是心跳停、watch 事件堆在缓冲区、`hub daemon stop` 也变慢。
+        // 拿不到就返回 Busy，这批路径原样排回 pending，下一个 tick 再试 ——
+        // 反正文件在磁盘上不会跑，晚一秒进索引没有任何后果。
+        //
+        // 用户命令（`hub index` / `hub merge`）的默认值正好相反：他们明确说了
+        // "现在写"，等是对的行为。同一个机制，两种耐心，各自在入口处定。
+        engine.indexer_mut().set_lease_wait(std::time::Duration::ZERO);
         let log = Log::open(St::log_path(&data), echo);
         let state = St {
             pid: std::process::id(),
@@ -328,6 +338,10 @@ impl Daemon {
                         // 没什么可合的。不刷日志：这条每 3 小时一次，
                         // 刷出来只会让日志里全是"无事发生"
                         Ok(false) => {}
+                        // 有人正握着租约：不是错误，下一个周期再来
+                        Err(e) if e.is_busy() => {
+                            self.log.info(format!("要合并时写租约被占用（{e}），下个周期再试"));
+                        }
                         Err(e) => self.log.error(format!("段合并失败：{e}")),
                     }
                 }
@@ -377,6 +391,10 @@ impl Daemon {
         if !pending.is_empty() {
             self.process_pending(&mut pending);
         }
+        // 收尾这一下愿意等：主循环里等锁会拖住心跳和停止操作，而这里已经没下个
+        // tick 了。不写进去的数据不会丢（下次启动的冷启动对账会补上），
+        // 但会晚到，而"我刚改完就关掉 daemon"恰恰是最容易碰到的一刻。
+        self.engine.indexer_mut().set_lease_wait(Duration::from_secs(2));
         if let Err(e) = self.engine.indexer_mut().flush() {
             self.log.error(format!("退出前提交失败：{e}"));
         }
@@ -424,7 +442,19 @@ impl Daemon {
         let report = match self.engine.index_paths(&paths) {
             Ok(r) => r,
             Err(e) => {
-                self.log.error(format!("索引变更失败：{e}"));
+                if e.is_busy() {
+                    // 另一个写者（多半是一次 `hub index` 大扫描）正握着租约。
+                    // 把这批路径原样排回去，下个 tick 再试：daemon 从不为等锁
+                    // 而挂住主循环 —— 那会让心跳停、事件堆在缓冲区、
+                    // `hub daemon stop` 也变慢。
+                    //
+                    // 重排是安全的，因为**一条都还没写进去**：`flush` 是先拿租约
+                    // 再动手，拿不到就直接返回，水位表与倒排都还是原样。
+                    pending.extend(paths);
+                    self.log.info(format!("写租约被占用（{e}），这批稍后重试"));
+                } else {
+                    self.log.error(format!("索引变更失败：{e}"));
+                }
                 return;
             }
         };

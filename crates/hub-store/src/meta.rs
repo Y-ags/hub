@@ -19,6 +19,30 @@ use crate::Result;
 /// close，几十毫秒内完成），又远小于正常编辑间隔，不会让快通道失效。
 const FRESH_WINDOW: i64 = 3;
 
+/// 打开水位表最多试几次。退避 20 / 40 / 80 / 160 / 320ms。
+///
+/// 为什么要 6 次而不是 2 次：并发打开同一个 WAL 库的窗口可能持续上百毫秒
+/// （两个进程把 `-shm` 建起来又拆掉，反复走恢复路径），实测 4 次（140ms）
+/// 在压测下仍会漏一次。620ms 的总预算对一次启动来说可以接受，
+/// 而它换掉的是"用户偶发看到 attempt to write a readonly database"。
+const OPEN_ATTEMPTS: u32 = 6;
+
+/// 这个错误是不是"等一会儿再来就行"。
+///
+/// 只认三种：`BUSY` / `LOCKED` / `READONLY`。前两个是显式的"有人在写"，
+/// 第三个是 Windows 上并发打开 WAL 库时 SQLite 给出的瞬时状态（见 [`MetaStore::open`]）。
+/// 其它错误（磁盘满、库损坏、没权限）重试一万次也一样，直接抛。
+fn open_transient(e: &crate::StoreError) -> bool {
+    use rusqlite::ErrorCode;
+    match e {
+        crate::StoreError::Sql(rusqlite::Error::SqliteFailure(err, _)) => matches!(
+            err.code,
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked | ErrorCode::ReadOnly
+        ),
+        _ => false,
+    }
+}
+
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -41,6 +65,12 @@ pub struct MetaStore {
 }
 
 impl MetaStore {
+    /// 打开（必要时创建）水位表。
+    ///
+    /// 带重试：两个进程**同时**打开同一个 WAL 库时，后到的那个有概率拿到一个
+    /// 瞬时错误（实测 `SQLITE_READONLY / attempt to write a readonly database`
+    /// —— 一方正在做 WAL 恢复、拿 `-shm` 独占锁，另一方连恢复都挤不进去）。
+    /// 这不是真的只读，隔几十毫秒重开就好了。见 [`open_transient`]。
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -48,7 +78,32 @@ impl MetaStore {
                 std::fs::create_dir_all(parent)?;
             }
         }
+        let mut attempt = 0u32;
+        loop {
+            match Self::open_once(path) {
+                Ok(s) => return Ok(s),
+                Err(e) if open_transient(&e) && attempt + 1 < OPEN_ATTEMPTS => {
+                    attempt += 1;
+                    // 20ms / 40ms / 80ms：WAL 恢复是毫秒级的，退避不用更复杂
+                    std::thread::sleep(std::time::Duration::from_millis(20 << (attempt - 1)));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn open_once(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // ⚠️ busy_timeout 必须**最先**装上，早于下面任何一条语句。
+        //
+        // 这不是洁癖，是实测出来的：WAL 库的第一个打开者会去拿 `-shm` 的独占锁做恢复，
+        // 如果这一刻另一个连接正好也在打开同一个库，没装 busy handler 的那一方
+        // 不会等，而是直接失败。装上之后失败率从 4/100 降到 1/100 ——
+        // 降不下去的那一份就是 `open` 外面那层重试在兜的。
+        //
+        // 用 API 而不是 `PRAGMA busy_timeout`：PRAGMA 本身也是一条要执行的语句，
+        // 而我们要的是"在第一条语句之前生效"。
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
@@ -58,7 +113,7 @@ impl MetaStore {
             -- search --local）。WAL 允许多读一写，但两个写者仍会撞上写锁；
             -- SQLite 默认的 busy_timeout 是 0，撞上就直接返回 SQLITE_BUSY，
             -- 用户看到的是"database is locked"这种毫无意义的报错。
-            PRAGMA busy_timeout = 5000;
+            -- （busy_timeout 已在上面用 API 设过了，这里不再重复。）
 
             CREATE TABLE IF NOT EXISTS doc_meta (
                 source       TEXT    NOT NULL,

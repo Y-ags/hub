@@ -284,6 +284,31 @@ impl HubIndex {
         Ok(opstamp)
     }
 
+    /// 提交 + **等后台合并线程彻底停手**，然后释放写入器。
+    ///
+    /// 为什么非得等：`commit()` 只是把这一批文档写进段，提交之后 Tantivy 的
+    /// 合并线程还会继续干活（重写段文件、删旧段）。这些动作发生在
+    /// `commit()` 返回**之后**，而写入器的目录锁在 `drop` 时就放掉了。
+    ///
+    /// 表现（实测，Windows）：daemon 的一次 flush 刚提交完就 drop，合并线程还在
+    /// 改文件；这时另一个进程拿到租约开始写，两边的文件操作撞上，报的是
+    /// `Failed to open file for write ... PermissionDenied（拒绝访问）` ——
+    /// 一个看上去和"并发"毫无关系的错误。
+    ///
+    /// 所以租约的真实边界必须是"写入器的一生"，不是"这一次 commit"。
+    pub fn commit_and_finish(&self, mut writer: IndexWriter) -> Result<u64> {
+        let opstamp = writer.commit()?;
+        self.reader.reload()?;
+        writer.wait_merging_threads()?;
+        Ok(opstamp)
+    }
+
+    /// 不提交，只等后台合并收尾。`merge_all` 内部已经 commit 过，用这个收尾。
+    pub fn quiesce(&self, writer: IndexWriter) -> Result<()> {
+        writer.wait_merging_threads()?;
+        Ok(())
+    }
+
     pub fn reload(&self) -> Result<()> {
         self.reader.reload()?;
         Ok(())

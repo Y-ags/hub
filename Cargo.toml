@@ -13,9 +13,13 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# Tantivy 0.26.1 的 MSRV。注意：必须在每个 crate 里写 `rust-version.workspace = true`
-# 才会真正继承，否则它只是一行装饰 —— cargo 不会因此报错。
-rust-version = "1.86"
+# 1.86 是 Tantivy 0.26.1 的 MSRV，但本项目自己还要 1.89：
+# `std::fs::File::lock / try_lock / unlock` 是 1.89 才稳定的（之前只能上 fs2 / fd-lock）。
+# 写租约（`hub-store::lease`）就建立在这三个函数上 —— 与其引一个二十行的依赖，
+# 不如要求工具链跟上一个已经稳定的标准库 API。
+# 注意：必须在每个 crate 里写 `rust-version.workspace = true` 才会真正继承，
+# 否则它只是一行装饰 —— cargo 不会因此报错。
+rust-version = "1.89"
 
 [profile.release]
 opt-level = 3

@@ -41,6 +41,10 @@ pub fn spawn_detached_command(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
 
+    // 必须先清掉"可继承"标记，再 spawn。原因见函数注释 —— 这一步不做，
+    // `hub daemon start | tail` 会一直挂着。
+    clear_std_handle_inheritance();
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -67,8 +71,48 @@ pub fn spawn_detached_command(
     }
 }
 
-fn base_command(data: &Path) -> std::io::Result<std::process::Command> {
-    use std::process::{Command, Stdio};
+/// 把本进程的 stdin / stdout / stderr 标成"不可继承"。
+///
+/// ## 为什么必须做（实测出来的，不是理论洁癖）
+///
+/// Windows 的 `CreateProcess` 一旦 `bInheritHandles = TRUE`（`Command::spawn`
+/// 在需要重定向标准流时必然如此），就会把**当前进程里所有带继承标记的句柄**
+/// 复制给子进程 —— 不只是我们显式指定的那三个。
+///
+/// 于是 `hub daemon start ~/code | tail -3` 这种写法会这样：
+/// 1. shell 给管道两端建了可继承的句柄；
+/// 2. `hub` 进程启动 daemon 子进程，子进程顺手继承了**管道写端**；
+/// 3. `hub` 退出，但管道的写端还被后台的 daemon 拿着；
+/// 4. `tail` 等不到 EOF，永远不结束 —— 命令看起来"卡死了"，其实 daemon 早已就位。
+///
+/// 实测：不加这一步，`hub daemon start | tail` 100% 挂住（等了十分钟也没返回）。
+/// 加了之后立刻正常。同样的坑对 `hub ui --detach | ...` 一样成立。
+///
+/// 反过来不成立：我们自己的标准流不需要被任何子进程继承（子进程的流是
+/// `Stdio::null()`），所以清掉标记没有副作用。
+fn clear_std_handle_inheritance() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::Foundation::{
+            SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let h = GetStdHandle(which);
+            // 没有控制台时（比如从计划任务里跑）这里会是 NULL，
+            // 句柄无效时 SetHandleInformation 会失败，直接跳过
+            if h.is_null() || h == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+        }
+    }
+}
+
+fn base_command(data: &Path) -> std::io::Result<std::process::Command> {    use std::process::{Command, Stdio};
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
     // run 是前台实现，被 detach 之后它就是后台进程
