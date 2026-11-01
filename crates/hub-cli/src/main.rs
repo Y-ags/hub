@@ -29,7 +29,7 @@ hub —— 本地离线多源个人检索中枢
         启动后台守护进程，之后改了文件自动进索引，不用再手动 index
   hub search <查询> [--limit N] [--local]
         自然语言检索。支持「上个月」「代码片段」\"精确短语\" -排除词
-        daemon 在跑时直接问它（不必再打开索引）；--local 强制走本地
+        daemon 在跑时直接问它（省掉再开一份引擎）；--local 强制走本地
 
 索引维护:
   hub index <目录>... [--history] [--max-mb N] [--reset]
