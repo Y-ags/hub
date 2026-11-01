@@ -55,8 +55,9 @@ hub —— 本地离线多源个人检索中枢
 界面:
   hub ui [--hotkey ctrl+alt+space] [--hidden] [--detach]
         唤起式搜索窗。Ctrl+Alt+Space 随时唤出，Esc 收起，Enter 打开选中项
+        托盘里有图标：左键唤出，右键「打开搜索窗 / 退出」
         --detach 放到后台（不占终端），配合开机自启用
-        --hidden 只注册热键、不先弹窗
+        --hidden 只注册热键和托盘图标、不先弹窗
         已经开着时再执行一次不会开第二个，只是把窗口唤出来
 
   hub              进入交互模式（只有检索）
@@ -886,6 +887,7 @@ fn spawn_ui_background(data: &Path, hotkey: Option<&str>) -> Result<(), String> 
         "热键：{}   （被占用时会自动退到 Ctrl+Alt+K）",
         hotkey.unwrap_or("Ctrl+Alt+Space")
     );
+    println!("托盘里有图标：左键唤出，右键可以退出");
     println!("要它开机自启，把这条命令做成快捷方式放进 shell:startup");
     Ok(())
 }

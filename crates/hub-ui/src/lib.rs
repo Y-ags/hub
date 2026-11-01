@@ -14,6 +14,8 @@
 #[cfg(windows)]
 mod theme;
 #[cfg(windows)]
+mod tray;
+#[cfg(windows)]
 mod win;
 #[cfg(windows)]
 mod wnd;

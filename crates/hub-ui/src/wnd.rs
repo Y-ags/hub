@@ -47,6 +47,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::query::{Engine, Row, Via};
 use crate::theme as t;
+use crate::tray::{self, Tray, WM_TRAY};
 use crate::win::{wide, NO};
 use crate::Options;
 
@@ -104,6 +105,9 @@ pub struct App {
     /// 上一次真正执行的查询。用来区分"还没输入"和"输入了但没命中" ——
     /// 这两种情况中间的提示语完全不同
     last_query: String,
+    /// 托盘图标。`None` = 没加上（比如资源管理器不在），此时界面照常能用，
+    /// 只是没法从托盘退出
+    tray: Option<Tray>,
 }
 
 impl Drop for App {
@@ -256,6 +260,7 @@ pub fn run(data: &Path, opts: Options) -> Result<(), String> {
             elapsed: 0.0,
             note: String::new(),
             last_query: String::new(),
+            tray: None,
         }));
         let app = &mut *app_ptr;
         app.build_children(hinst)?;
@@ -271,6 +276,9 @@ pub fn run(data: &Path, opts: Options) -> Result<(), String> {
         );
 
         app.register_hotkey(opts.hotkey.as_deref());
+        // 托盘要在热键注册之后：提示文字里写着热键是哪一组，
+        // 没注册上时那句提示也要如实说明
+        app.attach_tray();
         app.layout();
         app.run_query();
 
@@ -409,6 +417,68 @@ impl App {
             }
         }
         self.note = "全局热键被占用".into();
+    }
+
+    /// 托盘悬浮提示。写清热键，用户才不用去翻文档 ——
+    /// 这个窗口没有任务栏按钮，托盘是唯一能"看到它"的地方。
+    fn tip(&self) -> String {
+        match &self.hotkey {
+            Some((_, _, label)) => format!("Hub 搜索　{label}"),
+            None => "Hub 搜索（热键被占用）".into(),
+        }
+    }
+
+    fn attach_tray(&mut self) {
+        // 加不上不是致命错误：窗口、热键都还能用，只是没法从托盘退出。
+        // 所以这里不返回 Err，也不打扰用户
+        self.tray = Tray::attach(self.hwnd, &self.tip());
+        trace(format!(
+            "tray attach -> present={} added={}",
+            self.tray.is_some(),
+            self.tray.as_ref().is_some_and(|t| t.is_added())
+        ));
+    }
+
+    fn is_taskbar_msg(&self, msg: u32) -> bool {
+        self.tray
+            .as_ref()
+            .is_some_and(|t| t.taskbar_msg() != 0 && msg == t.taskbar_msg())
+    }
+
+    fn on_taskbar_recreated(&mut self) {
+        let tip = self.tip();
+        if let Some(t) = self.tray.as_mut() {
+            t.reattach(self.hwnd, &tip);
+            trace(format!("tray reattach -> added={}", t.is_added()));
+        }
+    }
+
+    fn tray_menu(&mut self) {
+        let hotkey = match &self.hotkey {
+            Some((_, _, label)) => label.clone(),
+            None => "未注册".to_string(),
+        };
+        // 状态读的是"上一次查询留下的值"，不是实时去问一遍索引 ——
+        // 右键菜单该立刻弹出来，不能让它等一次 IO
+        let status = if self.num_docs == 0 {
+            "索引是空的".to_string()
+        } else {
+            format!("索引 {} 篇 · {}", self.num_docs, self.via.label())
+        };
+        let cmd = match self.tray.as_ref() {
+            Some(t) => t.popup(self.hwnd, &hotkey, &status),
+            None => tray::Cmd::None,
+        };
+        match cmd {
+            tray::Cmd::Show => self.present(),
+            // 退出走 DestroyWindow，和点窗口关闭是同一条路：
+            // WM_DESTROY 里注销热键、删托盘、PostQuitMessage。
+            // 直接 PostQuitMessage 会让窗口活着、热键没注销、进程退不干净
+            tray::Cmd::Quit => unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+            },
+            tray::Cmd::None => {}
+        }
     }
 
     fn layout(&self) {
@@ -819,6 +889,16 @@ unsafe extern "system" fn main_proc(
 ) -> LRESULT {
     let app = crate::win::state::<App>(hwnd);
 
+    // Explorer 重启后所有托盘图标被清空，系统为此广播一条注册消息。
+    // 不在最前面判：这条消息的 id 是运行时分配的，只能和目标值比，
+    // 放进 match 里得用 guard，反而更绕。
+    if app.as_ref().is_some_and(|a| a.is_taskbar_msg(msg)) {
+        if let Some(a) = app {
+            a.on_taskbar_recreated();
+        }
+        return 0;
+    }
+
     match msg {
         WM_ERASEBKGND => 1, // 背景自己画，别让系统刷一遍灰
 
@@ -932,6 +1012,18 @@ unsafe extern "system" fn main_proc(
             0
         }
 
+        // 托盘图标的鼠标消息。wParam 是图标 id，lParam 才是消息本身
+        WM_TRAY => {
+            if let Some(app) = app {
+                match tray::click_action(lp as u32) {
+                    tray::Click::Show => app.present(),
+                    tray::Click::Menu => app.tray_menu(),
+                    tray::Click::Ignore => {}
+                }
+            }
+            0
+        }
+
         WM_CLOSE => {
             windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd);
             0
@@ -939,8 +1031,13 @@ unsafe extern "system" fn main_proc(
 
         WM_DESTROY => {
             if let Some(app) = app {
-                if let Some(_) = app.hotkey {
+                if app.hotkey.is_some() {
                     UnregisterHotKey(hwnd, HOTKEY_ID);
+                }
+                // 先删托盘再退：留着不管的话图标会在托盘里多挂几秒，
+                // 那几秒里点它没有任何反应
+                if let Some(t) = app.tray.as_mut() {
+                    t.detach(hwnd);
                 }
             }
             PostQuitMessage(0);

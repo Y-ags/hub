@@ -17,7 +17,7 @@ hub search 上个月写的那个rust内存相关的代码片段
 
 ```bash
 cargo build --release          # 首次约 2–5 分钟（Tantivy + bundled SQLite）
-cargo test                     # 109 条测试，全部离线可跑
+cargo test                     # 114 条测试，全部离线可跑
 
 ./target/release/hub daemon start ~/code ~/notes --history --autostart  # 一步到位
 ./target/release/hub daemon status                            # 看它在干什么
@@ -90,6 +90,10 @@ hub ui --hotkey ctrl+alt+j # 默认组合被别的软件占了时换一个
 
 窗口是无边框的，不占任务栏也不进 Alt+Tab —— 它是"一个浮层"，不是一个窗口。
 再执行一次 `hub ui` 不会开出第二个窗口，而是把已经有的那个叫到前面来。
+
+正因为没有任务栏按钮，**托盘里留了一个图标**（靛蓝放大镜）：左键唤出，右键是
+「打开搜索窗 / 快捷键 / 索引状态 / 退出」。没有它，用户想彻底关掉这个进程
+就只能去任务管理器。Windows 11 默认把新图标收进折叠区，拖出来一次它就常驻了。
 
 | 键 | 行为 |
 |---|---|
@@ -221,7 +225,7 @@ IPC：\\.\pipe\hub-021d15d4524f4531
 
 ```
 hub-cli         参数 / IO / 打印，不含检索逻辑也不含采集逻辑
-hub-ui          唤起式搜索窗（Win32 原生控件，零第三方依赖，仅 Windows）
+hub-ui          唤起式搜索窗 + 托盘图标（Win32 原生控件，零第三方依赖，仅 Windows）
 hub-daemon      常驻进程：watcher + debounce + 对账 + 空闲合并 + 历史轮询 + 自启 + IPC
 hub-engine      采集流水线（scan_all / index_paths / remove_paths / reconcile）
 hub-store       MetaStore(SQLite) + HubIndex(Tantivy) + Indexer(胶水)
@@ -301,6 +305,9 @@ hub-connectors  files / terminal 采集器（零依赖）
 | mtime 相同就是没变 | mtime 只有**秒**精度，同一秒内的修改会被吃掉。要给"刚改过的文件"加新鲜度保护 |
 | 跳过规则拿绝对路径判 | root 在 `%TEMP%` / `%APPDATA%` 下时整棵树都被判成噪声。只能判 root 以下的相对路径 |
 | `DETACHED_PROCESS` 就够脱离父进程 | 父进程在 Job Object 里时还会被一起带走，要加 `CREATE_BREAKAWAY_FROM_JOB` |
+| 收到 `TaskbarCreated` 就重加托盘图标，加过就跳过 | `added` 只表示"我们加过"，不代表**新的** explorer 认识它。资源管理器一重启，标记还是 true，于是永远跳过重加，图标再也回不来 |
+| 托盘图标重加 = 再发一次 `NIM_ADD` | 同一个 hWnd + uID 还没删时系统不覆盖，直接返回失败。必须先 `NIM_DELETE` 再 `NIM_ADD`（删不掉也无所谓，真重启时本来就没了） |
+| `TrackPopupMenu` 弹之前不用管前台窗口 | 不先 `SetForegroundWindow` 的话，点空白处菜单不收起，要点两次；弹完还要补一个 `PostMessage(WM_NULL)` |
 
 ### 界面（Win32）
 
@@ -319,7 +326,10 @@ hub-connectors  files / terminal 采集器（零依赖）
 ## 已知边界
 
 - **界面只有 Windows 版**：Win32 原生控件（原因见上），Linux/macOS 没做
-- **搜索窗没有托盘图标**：想关掉它只能去任务管理器结束 `hub.exe`
+- **托盘图标在 Win11 默认收进折叠区**：系统对新图标一律折叠，用户拖出来一次才常驻。
+  程序无法替用户固定（微软没给 API）
+- **托盘菜单里的"索引 N 篇"是上次查询留下的值**：不是实时去问索引 —— 右键菜单必须
+  立刻弹出，不能让它等一次 IO
 - **没有截图 OCR、聊天记录 connector**
 - **开机自启只实现了 Windows**（HKCU Run 键）；Linux / macOS 需自己配 systemd unit / launchd
 - **非 UTF-8 文件直接跳过**（GBK 会变乱码，宁可漏不要脏）
@@ -335,7 +345,7 @@ hub-connectors  files / terminal 采集器（零依赖）
 ## 下一步
 
 ```
-1. 搜索窗托盘图标（现在只能任务管理器杀进程）
+1. IPC 扩到 stats / index（现在这两个仍走本地连接）
 2. 截图 OCR / 聊天记录 connector
 3. Linux / macOS 版界面（IME 在 GTK/Qt 上是现成的，成本比 Windows 低）
 ```
