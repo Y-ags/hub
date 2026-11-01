@@ -56,9 +56,13 @@ hub —— 本地离线多源个人检索中枢
   hub ui [--hotkey ctrl+alt+space] [--hidden] [--detach]
         唤起式搜索窗。Ctrl+Alt+Space 随时唤出，Esc 收起，Enter 打开选中项
         托盘里有图标：左键唤出，右键「打开搜索窗 / 退出」
-        --detach 放到后台（不占终端），配合开机自启用
+        --detach 放到后台（不占终端）
         --hidden 只注册热键和托盘图标、不先弹窗
         已经开着时再执行一次不会开第二个，只是把窗口唤出来
+
+  hub ui install [--hotkey ...]   登录时自动启动（隐藏窗口，只等热键）
+  hub ui uninstall               取消
+  hub ui status                  看自启状态和窗口是否在跑
 
   hub              进入交互模式（只有检索）
 
@@ -813,6 +817,7 @@ fn cmd_ui(data: &Path, args: &[String]) -> Result<(), String> {
     let mut hotkey: Option<String> = None;
     let mut hidden = false;
     let mut detach = false;
+    let mut sub: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -831,7 +836,25 @@ fn cmd_ui(data: &Path, args: &[String]) -> Result<(), String> {
             }
             "--hidden" => hidden = true,
             "--detach" => detach = true,
-            other => return Err(format!("未知参数 {other}")),
+            other if other.starts_with('-') => return Err(format!("未知参数 {other}")),
+            // 第一个不带横线的词当子命令。不用 clap，这个规模不值得引入
+            other => {
+                if sub.replace(other.to_string()).is_some() {
+                    return Err(format!("最多只能给一个子命令，多余的是 {other}"));
+                }
+            }
+        }
+    }
+
+    match sub.as_deref() {
+        None => {}
+        Some("install") => return ui_install(data, hotkey.as_deref()),
+        Some("uninstall") => return ui_uninstall(),
+        Some("status") => return ui_status(),
+        Some(other) => {
+            return Err(format!(
+                "未知子命令 {other}。可用的：install / uninstall / status"
+            ))
         }
     }
 
@@ -844,6 +867,60 @@ fn cmd_ui(data: &Path, args: &[String]) -> Result<(), String> {
         println!("热键：{h}");
     }
     hub_ui::run(data, hub_ui::Options { hotkey, hidden })
+}
+
+/// 装开机自启。
+///
+/// 和 `hub daemon install` 分开两个注册表值：一个桌面工具通常两个都要
+/// （daemon 建索引、搜索窗等热键），但用户可能只想留一个。
+fn ui_install(data: &Path, hotkey: Option<&str>) -> Result<(), String> {
+    use hub_daemon::autostart;
+
+    let exe = std::env::current_exe().map_err(|e| format!("拿不到自身路径：{e}"))?;
+    let cmd = autostart::ui_command_line(&exe, data, hotkey);
+    if autostart::is_enabled_as(autostart::VALUE_UI) {
+        println!("搜索窗的开机自启已经开着。重跑会覆盖（比如换了热键）。");
+    }
+    autostart::install_as(autostart::VALUE_UI, &cmd)?;
+
+    println!("已设置开机自启（当前用户，登录时启动，窗口隐藏），不需要管理员权限。");
+    println!("  命令：{cmd}");
+    println!("  位置：HKEY_CURRENT_USER\\{}", autostart::RUN_KEY);
+    println!(
+        "\n登录后它就在托盘里，按 {} 唤出。",
+        hotkey.unwrap_or("Ctrl+Alt+Space")
+    );
+    println!("取消：hub ui uninstall");
+    println!("也可以在任务管理器「启动」标签里临时禁用，不用删。");
+    Ok(())
+}
+
+fn ui_uninstall() -> Result<(), String> {
+    use hub_daemon::autostart;
+    autostart::uninstall_as(autostart::VALUE_UI)?;
+    println!("已取消搜索窗的开机自启。正在运行的那个不受影响。");
+    println!("要关掉它：托盘图标右键 → 退出。");
+    Ok(())
+}
+
+fn ui_status() -> Result<(), String> {
+    use hub_daemon::autostart;
+    match autostart::enabled_as(autostart::VALUE_UI) {
+        Some(cmd) => {
+            println!("开机自启：已开");
+            println!("  命令：{cmd}");
+        }
+        None => println!("开机自启：未开（hub ui install 开启）"),
+    }
+    println!(
+        "当前搜索窗：{}",
+        if hub_ui::window_exists() {
+            "已在运行"
+        } else {
+            "没在运行（hub ui --detach 起一个）"
+        }
+    );
+    Ok(())
 }
 
 /// 把界面放到后台：起一个不带控制台的自己。
@@ -888,7 +965,7 @@ fn spawn_ui_background(data: &Path, hotkey: Option<&str>) -> Result<(), String> 
         hotkey.unwrap_or("Ctrl+Alt+Space")
     );
     println!("托盘里有图标：左键唤出，右键可以退出");
-    println!("要它开机自启，把这条命令做成快捷方式放进 shell:startup");
+    println!("要它开机自启：hub ui install");
     Ok(())
 }
 

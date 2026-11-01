@@ -17,7 +17,7 @@ hub search 上个月写的那个rust内存相关的代码片段
 
 ```bash
 cargo build --release          # 首次约 2–5 分钟（Tantivy + bundled SQLite）
-cargo test                     # 114 条测试，全部离线可跑
+cargo test                     # 117 条测试，全部离线可跑
 
 ./target/release/hub daemon start ~/code ~/notes --history --autostart  # 一步到位
 ./target/release/hub daemon status                            # 看它在干什么
@@ -86,6 +86,8 @@ cargo test                     # 114 条测试，全部离线可跑
 hub ui                     # 前台跑，Ctrl+Alt+Space 唤出
 hub ui --detach            # 丢到后台（关掉终端也不影响）
 hub ui --hotkey ctrl+alt+j # 默认组合被别的软件占了时换一个
+hub ui install             # 登录时自动起来（隐藏窗口，只等热键）
+hub ui status              # 自启开了吗、窗口在不在跑
 ```
 
 窗口是无边框的，不占任务栏也不进 Alt+Tab —— 它是"一个浮层"，不是一个窗口。
@@ -94,6 +96,9 @@ hub ui --hotkey ctrl+alt+j # 默认组合被别的软件占了时换一个
 正因为没有任务栏按钮，**托盘里留了一个图标**（靛蓝放大镜）：左键唤出，右键是
 「打开搜索窗 / 快捷键 / 索引状态 / 退出」。没有它，用户想彻底关掉这个进程
 就只能去任务管理器。Windows 11 默认把新图标收进折叠区，拖出来一次它就常驻了。
+
+`hub ui install` 把这条命令写进 `HKCU\...\Run`（和 `hub daemon install` 是**两个
+不同的注册表值**，互不覆盖），所以登录之后它已经在那儿了，不用先想起来启动它。
 
 | 键 | 行为 |
 |---|---|
