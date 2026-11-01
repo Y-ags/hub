@@ -231,7 +231,8 @@ hub ui --detach
 - **`hub index` 和 daemon 同时跑是安全的**。两者都是写者，靠写租约排队：
   谁先拿到谁写，另一个等（用户命令最多等 30 秒，daemon 干脆不等 —— 试一下，
   忙就把这批路径排回去，下个 tick 再试）。不会再出现
-  `Failed to acquire index lock` 那种随机失败。细节见 README「三个写者怎么排队」。
+  `Failed to acquire index lock` 那种随机失败。细节见
+  [`docs/ENGINEERING.md`](docs/ENGINEERING.md) 的「三个写者怎么排队」。
 - **`hub reset` 要求 daemon 先停**。daemon 用 mmap 拿着段文件，Windows 上这些文件
   删不掉；硬来会在删到一半时失败。命令会直接拦下来并告诉你先 `hub daemon stop`。
 - **`daemon stop` 不影响开机自启**。"下次开机还要自动起来"正是自启的意思；

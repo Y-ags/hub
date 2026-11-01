@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="460" viewBox="0 0 1080 460" role="img" aria-label="hub 数据流架构">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9AA6BE"/>
+    </marker>
+    <style>
+      .box    { fill: #FFFFFF; stroke: #DFE4EF; stroke-width: 1.2; }
+      .accent { fill: #F4F6FF; stroke: #B9C2F2; stroke-width: 1.2; }
+      .t      { font-family: 'Microsoft YaHei UI','Segoe UI',system-ui,sans-serif; font-size: 17px; font-weight: 600; fill: #232838; }
+      .s      { font-family: 'Microsoft YaHei UI','Segoe UI',system-ui,sans-serif; font-size: 13.5px; fill: #7C879B; }
+      .cap    { font-family: 'Microsoft YaHei UI','Segoe UI',system-ui,sans-serif; font-size: 12.5px; fill: #8A93A6; }
+      .mono   { font-family: Consolas,'Cascadia Mono',monospace; font-size: 14.5px; font-weight: 600; fill: #232838; }
+    </style>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="1079" height="459" rx="16" fill="#FBFCFE" stroke="#E7EBF3"/>
+
+  <!-- 第一行：写入路径 -->
+  <rect class="box" x="40" y="84" width="210" height="116" rx="12"/>
+  <text class="t" x="64" y="124">数据来源</text>
+  <text class="s" x="64" y="150">文件系统 · 终端历史</text>
+  <text class="s" x="64" y="172">浏览器历史</text>
+
+  <rect class="box" x="300" y="84" width="210" height="116" rx="12"/>
+  <text class="mono" x="324" y="124">hub-connectors</text>
+  <text class="s" x="324" y="150">遍历 · 去重 · 归类</text>
+
+  <rect class="box" x="560" y="84" width="210" height="116" rx="12"/>
+  <text class="mono" x="584" y="124">hub-engine</text>
+  <text class="s" x="584" y="150">全量扫描 · 增量对账</text>
+
+  <rect class="accent" x="820" y="84" width="210" height="116" rx="12"/>
+  <text class="mono" x="844" y="124">hub-store</text>
+  <text class="s" x="844" y="150">水位表 · 倒排 · 租约</text>
+
+  <line x1="252" y1="142" x2="294" y2="142" stroke="#9AA6BE" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="512" y1="142" x2="554" y2="142" stroke="#9AA6BE" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="772" y1="142" x2="814" y2="142" stroke="#9AA6BE" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <text class="cap" x="40" y="228">只读，不动源文件</text>
+  <text class="cap" x="300" y="228">写：同一瞬间只有一个写者 —— writer.lock 排他，进程退出由内核释放</text>
+
+  <!-- 第二行：查询层 -->
+  <line x1="925" y1="202" x2="925" y2="284" stroke="#9AA6BE" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <rect class="box" x="300" y="292" width="730" height="104" rx="12"/>
+  <text class="t" x="326" y="330">查询层</text>
+  <text class="s" x="326" y="356">hub-cli 命令行 · hub-ui 唤起式搜索窗 · hub-daemon 的 IPC（命名管道）</text>
+  <text class="s" x="326" y="378">多读者并发，读不阻塞写；倒排走 mmap，不占堆</text>
+
+  <text class="cap" x="40" y="330">水位表是事实源</text>
+  <text class="cap" x="40" y="350">倒排是可重建的缓存</text>
+</svg>

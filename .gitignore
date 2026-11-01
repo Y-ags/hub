@@ -1,6 +1,8 @@
 /target
 /.hub
 /.workbuddy
+/demo-data
+/.shotgen
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
