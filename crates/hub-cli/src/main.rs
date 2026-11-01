@@ -27,8 +27,9 @@ hub —— 本地离线多源个人检索中枢
 日常用法（推荐）:
   hub daemon start ~/code ~/notes --history
         启动后台守护进程，之后改了文件自动进索引，不用再手动 index
-  hub search <查询>
+  hub search <查询> [--limit N] [--local]
         自然语言检索。支持「上个月」「代码片段」\"精确短语\" -排除词
+        daemon 在跑时直接问它（不必再打开索引）；--local 强制走本地
 
 索引维护:
   hub index <目录>... [--history] [--max-mb N] [--reset]
@@ -44,7 +45,7 @@ hub —— 本地离线多源个人检索中枢
         --autostart 顺带装开机自启，重启电脑后自动接着干
   hub daemon install   只装开机自启（不启动进程）
   hub daemon uninstall 取消开机自启
-  hub daemon status    看是否在跑、监听了什么、干了多少活
+  hub daemon status    看是否在跑、IPC 能不能应答、监听了什么、干了多少活
   hub daemon stop [--force]
         优雅停止（写停止标记，等它把攒着的数据写完）；--force 强制结束
   hub daemon log [-n 50]
@@ -201,6 +202,7 @@ fn cmd_index(data: &Path, args: &[String]) -> Result<(), String> {
 fn cmd_search(data: &Path, args: &[String]) -> Result<(), String> {
     let mut limit = 10usize;
     let mut words: Vec<String> = Vec::new();
+    let mut local = false;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -211,6 +213,8 @@ fn cmd_search(data: &Path, args: &[String]) -> Result<(), String> {
                 .ok_or_else(|| "--limit 需要一个整数".to_string())?;
         } else if let Some(v) = a.strip_prefix("--limit=") {
             limit = v.parse().map_err(|_| "--limit 需要一个整数".to_string())?;
+        } else if a == "--local" {
+            local = true;
         } else {
             words.push(a.clone());
         }
@@ -219,6 +223,28 @@ fn cmd_search(data: &Path, args: &[String]) -> Result<(), String> {
     let q = words.join(" ");
     if q.trim().is_empty() {
         return Err("查询不能为空。用法：hub search <查询>".into());
+    }
+
+    // ---- 先问常驻进程 ----
+    //
+    // daemon 在跑的时候，它手里已经有一份随时 reload 的 reader。走 IPC 拿到的
+    // 就是"此刻最新"的结果，也不必让 CLI 再抢一次索引目录。
+    //
+    // 只在 daemon 明确不可用时才退回本地 —— 连不上、协议版本对不上、超时，
+    // 都算"不可用"。静默回退是有意的：用户不该因为后台进程的状态而改变命令用法。
+    if !local {
+        if let Some((reply, ms)) = daemon_search(data, &q, limit) {
+            if reply.num_docs == 0 {
+                return Err("索引是空的。先运行：hub index <目录>".into());
+            }
+            // 展示用的解析在本地做。它只影响"识别："那两行的措辞，
+            // 真正执行查询的是 daemon 那边自己解析的结果 —— 显示永远不能
+            // 影响语义，所以两边各解析一次是对的，不是重复。
+            let pq = hub_core::parse_query(&q, &hub_core::Dict::new());
+            print_plan(&pq);
+            print_result(&reply.hits, ms, true);
+            return Ok(());
+        }
     }
 
     let indexer = Indexer::open(data).map_err(|e| format!("打开数据目录失败：{e}"))?;
@@ -233,13 +259,47 @@ fn cmd_search(data: &Path, args: &[String]) -> Result<(), String> {
     let elapsed = started.elapsed().as_secs_f32() * 1000.0;
 
     print_plan(&pq);
+    print_result(&hits, elapsed, false);
+    Ok(())
+}
+
+/// 命中的统一输出。`via_daemon` 只是给用户一个"这句话是谁回答的"的提示 ——
+/// 排查"为什么结果和 daemon 状态有关"时，这一行能省掉一堆猜测。
+fn print_result(hits: &[Hit], elapsed: f32, via_daemon: bool) {
     if hits.is_empty() {
         println!("（无结果）换个说法，或去掉时间/来源约束试试");
-        return Ok(());
+        return;
     }
-    println!("命中 {} 条，{:.1} ms\n", hits.len(), elapsed);
-    print_hits(&hits, now_secs());
-    Ok(())
+    let via = if via_daemon { "（经 daemon）" } else { "" };
+    println!("命中 {} 条，{:.1} ms{}\n", hits.len(), elapsed, via);
+    print_hits(hits, now_secs());
+}
+
+/// 问常驻进程要结果。返回 `None` 表示"这条路走不通，请退回本地"。
+///
+/// 刻意把所有失败都收敛成 `None`：对用户来说 daemon 在不在跑是环境细节，
+/// 不该让 `hub search` 从"能用"变成"报错"。
+///
+/// 返回的 `f32` 只算**那次检索**的往返，不含建连接和 ping。本地路径的
+/// 计时也是从 `search()` 开始算的（不含 `Indexer::open`），两边口径一致 ——
+/// 否则 IPC 会把连接开销算进去，看起来反而比本地慢。
+fn daemon_search(data: &Path, q: &str, k: usize) -> Option<(hub_daemon::ipc::SearchReply, f32)> {
+    use hub_daemon::ipc;
+
+    let mut c = ipc::Client::connect(data).ok()?;
+
+    // 版本先对一次。升级之后旧 daemon 可能还在跑，它的响应格式未必还认得 ——
+    // 宁可这边慢一点自己去打开索引，也不能把一个解析歪了的结果当答案。
+    let pong = c.ping().ok()?;
+    if pong.proto != ipc::PROTO {
+        return None;
+    }
+
+    let started = Instant::now();
+    let resp = c.call(&ipc::encode_search(k, q)).ok()?;
+    let ms = started.elapsed().as_secs_f32() * 1000.0;
+    let reply = ipc::parse_search_reply(&resp).ok()?;
+    Some((reply, ms))
 }
 
 /// 把解析结果摊开给用户看 —— 搜不到时能立刻判断是"没这东西"还是"约束太严"
@@ -682,9 +742,29 @@ fn daemon_status(data: &Path) -> Result<(), String> {
             }
         );
     }
+    if st.is_alive() {
+        print_ipc(data);
+    }
     print_autostart(&autostart);
     println!("日志：{}", data.join("daemon.log").display());
     Ok(())
+}
+
+/// 真的连一下，而不是"状态文件说它在跑，所以 IPC 应该也在"。
+///
+/// 进程活着但服务线程卡死、或者端点建的时候失败了，都会表现成
+/// "看起来一切正常，只是 search 有点慢" —— 这一行就是用来把这种情况
+/// 变成一眼可见的。
+fn print_ipc(data: &Path) {
+    use hub_daemon::ipc;
+    let ep = ipc::endpoint(data);
+    match ipc::Client::connect(data).and_then(|mut c| c.ping()) {
+        Ok(p) => println!(
+            "IPC：{ep}\n     应答正常（协议 {}，倒排 {} 篇，pid {}）",
+            p.proto, p.num_docs, p.pid
+        ),
+        Err(e) => println!("IPC：{ep}\n     无应答：{e}\n     search 会退回本地打开索引"),
+    }
 }
 
 fn print_autostart(saved: &Option<String>) {

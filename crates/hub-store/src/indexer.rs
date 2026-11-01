@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hub_core::{Doc, DocId, ParsedQuery, SourceId};
@@ -42,7 +43,12 @@ impl IndexerStats {
 
 pub struct Indexer {
     meta: MetaStore,
-    index: HubIndex,
+    /// 用 `Arc` 而不是直接持有，是为了能把同一个 reader 交给别的线程（IPC 查询）。
+    ///
+    /// 这很关键：IPC 线程如果自己再 `open` 一次索引，就会有两套 reader，
+    /// 一套随 commit 刷新、一套等 `OnCommitWithDelay`，两边看到的"最新"不同。
+    /// 共用一个 `HubIndex` 才有唯一的事实。
+    index: Arc<HubIndex>,
     pending: Vec<Doc>,
     deletes: Vec<(SourceId, String)>,
     budget: usize,
@@ -76,7 +82,7 @@ impl Indexer {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
         let meta = MetaStore::open(dir.join("meta.sqlite"))?;
-        let index = HubIndex::open_or_create(dir.join("index"))?;
+        let index = Arc::new(HubIndex::open_or_create(dir.join("index"))?);
         Ok(Self {
             meta,
             index,
@@ -106,6 +112,14 @@ impl Indexer {
 
     pub fn index(&self) -> &HubIndex {
         &self.index
+    }
+
+    /// 拿一份共享只读句柄（IPC 查询线程用）。
+    ///
+    /// 注意的是：拿到的只是**索引**，不含水位表。查询路径本来也不需要
+    /// 水位表 —— 命中结果里的 uri/title/mtime 都在倒排的 stored fields 里。
+    pub fn index_handle(&self) -> Arc<HubIndex> {
+        Arc::clone(&self.index)
     }
 
     pub fn meta(&self) -> &MetaStore {

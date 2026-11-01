@@ -170,6 +170,14 @@ impl Engine {
         &mut self.indexer
     }
 
+    /// 共享只读的索引句柄，给常驻进程的查询线程用。
+    ///
+    /// 查询不需要 `&mut self`、也不碰水位表，所以可以和安全地跨线程共享 ——
+    /// 写入仍然只有主循环一条路径。
+    pub fn index_handle(&self) -> std::sync::Arc<hub_store::HubIndex> {
+        self.indexer.index_handle()
+    }
+
     pub fn search_text(&self, q: &str, k: usize) -> hub_store::Result<Vec<Hit>> {
         self.indexer.search_text(q, k)
     }

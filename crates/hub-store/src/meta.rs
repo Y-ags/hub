@@ -54,6 +54,11 @@ impl MetaStore {
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
+            -- daemon 常驻之后，同一个库一定会有第二个连接（CLI 的 stats /
+            -- search --local）。WAL 允许多读一写，但两个写者仍会撞上写锁；
+            -- SQLite 默认的 busy_timeout 是 0，撞上就直接返回 SQLITE_BUSY，
+            -- 用户看到的是"database is locked"这种毫无意义的报错。
+            PRAGMA busy_timeout = 5000;
 
             CREATE TABLE IF NOT EXISTS doc_meta (
                 source       TEXT    NOT NULL,

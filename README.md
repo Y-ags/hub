@@ -17,7 +17,7 @@ hub search 上个月写的那个rust内存相关的代码片段
 
 ```bash
 cargo build --release          # 首次约 2–5 分钟（Tantivy + bundled SQLite）
-cargo test                     # 90 条测试，全部离线可跑
+cargo test                     # 106 条测试，全部离线可跑
 
 ./target/release/hub daemon start ~/code ~/notes --history --autostart  # 一步到位
 ./target/release/hub daemon status                            # 看它在干什么
@@ -126,13 +126,49 @@ hub daemon uninstall                  # 取消
 
 `daemon stop` 只是停进程，**不会**关掉自启 —— 那正是"下次开机还要自动起来"的意思。
 
+### 查询走 IPC
+
+daemon 在跑的时候，`hub search` 不再自己打开索引，而是向它发一个请求
+（Windows 上走命名管道 `\\.\pipe\hub-<数据目录的哈希>`）。
+
+先说清楚它**不是**为了让搜索更快：`hub search` 的耗时几乎全在进程启动上，
+几百篇文档规模下"打开索引 + 检索"只有个位数毫秒，IPC 省掉的就是这几毫秒。
+
+它真正解决的是三件事：
+
+| 问题 | 走 IPC 之后 |
+|---|---|
+| daemon 在写、CLI 又开一份引擎，两个写者抢同一份目录锁 | 查询只读，不碰写入器 |
+| CLI 新开的 reader 要等 `OnCommitWithDelay` 才看到最新提交 | 用 daemon 手里那个 commit 即 reload 的 reader |
+| 以后要加 UI，需要一条"问一句就出结果"的通道 | 协议已经就位 |
+
+```
+$ hub search 零拷贝
+命中 3 条，0.9 ms（经 daemon）
+```
+
+**连不上就静默退回本地**：daemon 没在跑、协议版本对不上（升级后旧进程还在）、
+3 秒没响应，三种情况都走原来那条路。用户不该因为后台进程的状态而改变命令用法。
+`--local` 可以强制走本地。
+
+协议是 4 字节长度前缀 + 一行制表符分隔的文本（字段里的 `\t` `\n` `\` 做转义），
+只有两个动词：`ping` 和 `search`。`ping` 带协议版本号，CLI 靠它判断
+"对面这个 daemon 我还认得吗"。
+
+`hub daemon status` 会真的连一次并在状态里写明白：
+
+```
+IPC：\\.\pipe\hub-021d15d4524f4531
+     应答正常（协议 hub-ipc/1，倒排 66 篇，pid 20020）
+```
+
 ---
 
 ## 架构
 
 ```
 hub-cli         参数 / IO / 打印，不含检索逻辑也不含采集逻辑
-hub-daemon      常驻进程：watcher + debounce + 对账 + 空闲合并 + 历史轮询 + 自启
+hub-daemon      常驻进程：watcher + debounce + 对账 + 空闲合并 + 历史轮询 + 自启 + IPC
 hub-engine      采集流水线（scan_all / index_paths / remove_paths / reconcile）
 hub-store       MetaStore(SQLite) + HubIndex(Tantivy) + Indexer(胶水)
 hub-core        查询解析 / 中文分词 / BM25 / tombstone（零依赖）
@@ -192,6 +228,15 @@ hub-connectors  files / terminal 采集器（零依赖）
 | 改文件时直接 `add_document` 就是"更新" | **错**。Tantivy 没有 upsert，旧文档变成僵尸：搜索结果按 doc_id 去重把它藏起来，`stats` 里"倒排中"才会露馅（实测 15 vs 存活 6）。写入前必须先 `delete_term(uri)` |
 | 历史条目的 uri 用 `mtime + 命令` 算 | 纯文本历史（PSReadLine）没有时间戳，mtime 一追加就变 → **整份历史的 uri 全变**，每轮重写几千条。无时间戳时只能按命令算 uri |
 
+### 本地 IPC
+
+| 原假设 | 真实情况 |
+|---|---|
+| IPC 是为了让搜索更快 | 大半时间花在进程启动上，"打开索引 + 检索"只有几毫秒。省这个没意义 —— 真正的理由是**单一写者**和**看到同一份提交** |
+| IPC 线程自己 `open` 一次索引就行 | **不行**。两套 reader 会各自刷新：主循环 commit 后立刻可见，另一套要等 `OnCommitWithDelay`。必须把同一个 `Arc<HubIndex>` 交过去 |
+| 设个标记就能让阻塞在 `ConnectNamedPipe` 的线程退出 | **不能**。得自己连一次，用一条"连上就断"的空连接把它踢醒 |
+| 同步 `ReadFile` 能设读超时 | 字节模式管道上不能。要么上 overlapped I/O，要么用 `PeekNamedPipe` 轮询字节数自己算截止时间 |
+
 ### 文件监听（`ReadDirectoryChangesW`）
 
 | 原假设 | 真实情况 |
@@ -217,12 +262,13 @@ hub-connectors  files / terminal 采集器（零依赖）
   `stat`；敲完命令到能搜到最多差 5 秒。`history_poll_secs=0` 可关掉
 - **历史条目常驻内存一份 uri 集合**：约 50 字节/条，10 万条历史约 5MB
 - **目录重命名会当成"删 + 增"**：内容没变也要重新分词一遍，正确但有开销
+- **IPC 只回答 search**：`stats` / `index` 仍走本地。`hub index` 与 daemon 同时写
+  目前靠"内容哈希判定 + SQLite busy_timeout"共存，没有严格串行化
 
 ## 下一步
 
 ```
-1. hub-daemon ↔ CLI 的 IPC（现在靠状态文件，能读不能问）
-2. egui UI + global-hotkey
-3. 截图 OCR / 聊天记录 connector
-4. 真机内存基准（上线前必须做）
+1. egui UI + global-hotkey（IPC 通道已经就位）
+2. 截图 OCR / 聊天记录 connector
+3. 真机内存基准（上线前必须做）
 ```

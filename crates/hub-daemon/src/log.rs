@@ -26,6 +26,16 @@ impl Log {
         Self { path, file, echo }
     }
 
+    /// 不落盘的日志。测试里起 IPC 服务端要用它 —— 否则每跑一次测试
+    /// 就往真实 daemon.log 里写一堆东西。
+    pub fn silent() -> Self {
+        Self {
+            path: PathBuf::new(),
+            file: None,
+            echo: false,
+        }
+    }
+
     fn open_file(path: &Path) -> Option<File> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -51,6 +61,10 @@ impl Log {
             ok = f.write_all(line.as_bytes()).is_ok() && f.flush().is_ok();
         }
         if !ok {
+            // silent() 没有路径，不必每写一次就试着开一次文件
+            if self.path.as_os_str().is_empty() {
+                return;
+            }
             // 磁盘满 / 文件被占用：重新开一次，仍失败就静默丢弃 ——
             // 日志不该把主循环搞崩
             let path = self.path.clone();

@@ -35,6 +35,7 @@
 
 pub mod autostart;
 pub mod config;
+pub mod ipc;
 pub mod log;
 pub mod process;
 pub mod state;
@@ -64,6 +65,8 @@ pub struct Daemon {
     engine: Engine,
     log: Log,
     state: St,
+    /// 前台运行时为 true。IPC 线程自己开一份日志，回显设置得跟主日志一致。
+    echo: bool,
 }
 
 fn now_secs() -> i64 {
@@ -92,7 +95,7 @@ impl Daemon {
                 .collect(),
             ..Default::default()
         };
-        Ok(Self { data, cfg, engine, log, state })
+        Ok(Self { data, cfg, engine, log, state, echo })
     }
 
     pub fn engine(&self) -> &Engine {
@@ -155,6 +158,34 @@ impl Daemon {
             }
         }
         let _ = self.state.save(&self.data);
+
+        // ---- IPC ----
+        //
+        // 放在冷启动对账**之后**：对账期间索引还是空的，这时候回答查询
+        // 只会给出"有索引但搜不到"的假象。对账只要一两秒，让 CLI 在
+        // 这段时间自己打开索引（结果完整），比给它一个半成品答案强。
+        //
+        // 拿的是 `Arc<HubIndex>`，与主循环共用同一个 reader：主循环 commit
+        // 之后 reader 立刻 reload，IPC 这边下一次查询就能看到，不存在
+        // "两个 reader 各看各的"。
+        let ipc = match ipc::Server::start(
+            &self.data,
+            self.engine.index_handle(),
+            self.state.started_at,
+            Log::open(St::log_path(&self.data), self.echo),
+        ) {
+            Ok(s) => {
+                self.log.info(format!("IPC 就绪：{}", s.endpoint()));
+                Some(s)
+            }
+            Err(e) => {
+                // 不是致命错误：CLI 连不上会自己打开索引，只是慢一点
+                self.log.warn(format!(
+                    "IPC 启动失败（search 将退回本地打开索引）：{e}"
+                ));
+                None
+            }
+        };
 
         let debounce = Duration::from_millis(self.cfg.debounce_ms.max(50));
         let reconcile_every = Duration::from_secs(self.cfg.reconcile_secs.max(5));
@@ -348,6 +379,12 @@ impl Daemon {
         }
         if let Err(e) = self.engine.indexer_mut().flush() {
             self.log.error(format!("退出前提交失败：{e}"));
+        }
+        // 先停 IPC 再删状态文件：否则 `daemon stop` 返回后的一瞬间，
+        // CLI 还可能读到"进程 Alive"却连不上端点
+        if let Some(mut s) = ipc {
+            s.stop();
+            self.log.info("IPC 已停止");
         }
         state::clear_stop(&self.data);
         St::clear(&self.data);

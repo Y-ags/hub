@@ -417,3 +417,81 @@ fn rewrites_replace_instead_of_appending() {
     // 留下的必须是最后一版：mtime 被更新成了第 5 次写入时给的值
     assert_eq!(hits[0].mtime, 1_700_000_004, "应该是最后一版");
 }
+
+// ============================================================
+// 共享只读句柄（daemon 的 IPC 查询线程靠它）
+// ============================================================
+
+/// `index_handle()` 拿到的必须**是同一个 reader**，不是"又打开了一份"。
+///
+/// 这条是 IPC 正确性的全部基础：daemon 的 IPC 线程用这个句柄回答查询，
+/// 主循环用 `Indexer` 写入。如果句柄是另开的一份索引，IPC 就会一直
+/// 看到旧数据 —— 而这种错在单测里永远暴露不出来，只有"改了文件但搜不到"
+/// 才会被发现。
+#[test]
+fn shared_handle_sees_commits_from_the_writer() {
+    const NOW: i64 = 1_700_000_200;
+    let dir = TempDir::new().unwrap();
+    let mut ix = Indexer::open(dir.path()).unwrap();
+    let reader = ix.index_handle();
+    assert_eq!(reader.num_docs(), 0);
+
+    assert!(ix
+        .add(
+            SourceId::Files,
+            "files/a",
+            "第一篇".into(),
+            "关键词 shardprobe 在这里".into(),
+            1_700_000_000,
+        )
+        .unwrap());
+    ix.flush().unwrap();
+
+    // 没有 reload、没有重新 open，句柄就该看到 —— commit 内部已经 reload 过
+    assert_eq!(reader.num_docs(), 1, "共享句柄应看到刚提交的文档");
+    let pq = reader.parse("shardprobe");
+    assert_eq!(reader.search(&pq, 5, NOW).unwrap().len(), 1);
+
+    // 再写一篇，同一个句柄继续跟得上
+    assert!(ix
+        .add(
+            SourceId::Terminal,
+            "terminal://1",
+            "命令".into(),
+            "cargo build 关键词 shardprobe".into(),
+            1_700_000_100,
+        )
+        .unwrap());
+    ix.flush().unwrap();
+    assert_eq!(reader.num_docs(), 2);
+    assert_eq!(reader.search(&pq, 5, NOW).unwrap().len(), 2);
+
+    // 删除也要同步可见
+    ix.delete(SourceId::Files, "files/a");
+    ix.flush().unwrap();
+    let hits = reader.search(&pq, 5, NOW).unwrap();
+    assert_eq!(hits.len(), 1, "删掉的文档不该再出现：{hits:?}");
+    assert_eq!(hits[0].uri, "terminal://1");
+}
+
+/// 句柄是只读的：它不能凭空多出一个写入器，否则 daemon 会同时有两个写者。
+/// 这里用"另开一个 Indexer 仍能写"来反证 —— 如果句柄抢了写锁，这里会失败。
+#[test]
+fn shared_handle_does_not_hold_the_writer_lock() {
+    let dir = TempDir::new().unwrap();
+    let mut ix = Indexer::open(dir.path()).unwrap();
+    let _reader = ix.index_handle();
+
+    // 同一进程里再开一个 Indexer 并写入（模拟 CLI 的 --local 路径）。
+    // 两边的写入器是错开的，不该互相卡住。
+    let mut other = Indexer::open(dir.path()).unwrap();
+    assert!(other
+        .add(SourceId::Files, "files/b", "另一路".into(), "关键词 lockprobe".into(), 1_700_000_000)
+        .unwrap());
+    other.flush().unwrap();
+
+    // 写成功了就说明没被对方的锁卡住。这里断言 `other` 自己的视图 ——
+    // `ix` 的 reader 要等 OnCommitWithDelay 那一拍才会看到别人写的段，
+    // 那是另一个行为（跨 Indexer 的可见性延迟），不是这条测试要证的。
+    assert_eq!(other.index().num_docs(), 1);
+}
