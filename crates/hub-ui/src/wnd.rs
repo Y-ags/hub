@@ -636,9 +636,18 @@ impl App {
         if self.rows.is_empty() {
             if self.num_docs == 0 {
                 "索引是空的 · 先运行 hub daemon start <目录>".to_string()
-            } else {
+            } else if self.last_query.is_empty() {
                 format!(
                     "索引 {} 篇 · 输入关键词开始搜索（支持「上个月」「代码片段」-排除）",
+                    self.num_docs
+                )
+            } else {
+                // 搜过了但一条没命中：0 条也要给出耗时和通道。
+                // 否则状态栏还写着"输入关键词开始搜索"，看着像查询根本没执行。
+                format!(
+                    "0 条 · {:.1} ms · {} · 索引 {} 篇",
+                    self.elapsed,
+                    self.via.label(),
                     self.num_docs
                 )
             }
