@@ -12,7 +12,13 @@ pub struct HistoryEntry {
     pub cmd: String,
     /// unix 秒；0 表示历史文件里没有时间戳
     pub ts: i64,
-    /// 在历史文件里的行序号（1 起），用于生成稳定的 uri
+    /// `ts` 是文件里真的写着的，还是拿文件 mtime 兜的。
+    ///
+    /// 这个区分不是学术洁癖：PSReadLine 的纯文本历史没有时间戳，如果拿 mtime 兜底
+    /// 再拿去算 uri，文件每追加一条命令 mtime 就变，**整份历史的 uri 全部改变** ——
+    /// 表现是每次对账都把几千条历史重写一遍索引。
+    pub has_ts: bool,
+    /// 在历史文件里的行序号（1 起），用于调试定位
     pub index: usize,
 }
 
@@ -22,6 +28,7 @@ pub struct HistoryEntry {
 pub fn parse_history(text: &str, fallback_ts: i64) -> Vec<HistoryEntry> {
     let mut out: Vec<HistoryEntry> = Vec::new();
     let mut cur_ts = fallback_ts;
+    let mut cur_has_ts = false;
     let mut idx = 0usize;
     let mut pending_multiline: Option<usize> = None;
 
@@ -37,9 +44,15 @@ pub fn parse_history(text: &str, fallback_ts: i64) -> Vec<HistoryEntry> {
                     .and_then(|s| s.trim().parse::<i64>().ok());
                 if let Some(ts) = ts {
                     cur_ts = ts;
+                    cur_has_ts = true;
                     idx += 1;
                     pending_multiline = None;
-                    out.push(HistoryEntry { cmd: cmd.to_string(), ts: cur_ts, index: idx });
+                    out.push(HistoryEntry {
+                        cmd: cmd.to_string(),
+                        ts: cur_ts,
+                        has_ts: true,
+                        index: idx,
+                    });
                     continue;
                 }
             }
@@ -48,6 +61,7 @@ pub fn parse_history(text: &str, fallback_ts: i64) -> Vec<HistoryEntry> {
         // bash 时间戳行
         if let Some(ts) = line.strip_prefix('#').and_then(|s| s.trim().parse::<i64>().ok()) {
             cur_ts = ts;
+            cur_has_ts = true;
             continue;
         }
 
@@ -66,7 +80,12 @@ pub fn parse_history(text: &str, fallback_ts: i64) -> Vec<HistoryEntry> {
         }
 
         idx += 1;
-        out.push(HistoryEntry { cmd: line.to_string(), ts: cur_ts, index: idx });
+        out.push(HistoryEntry {
+            cmd: line.to_string(),
+            ts: cur_ts,
+            has_ts: cur_has_ts,
+            index: idx,
+        });
         if line.ends_with('\\') {
             pending_multiline = Some(out.len() - 1);
         }
@@ -152,6 +171,17 @@ mod tests {
         let v = parse_history("ls -al\ncargo test\n", 1_690_000_000);
         assert_eq!(v.len(), 2);
         assert!(v.iter().all(|e| e.ts == 1_690_000_000));
+        // 兜底来的时间必须被标记出来：拿它算 uri 会让整份历史的 uri 随 mtime 漂移
+        assert!(v.iter().all(|e| !e.has_ts));
+    }
+
+    #[test]
+    fn real_timestamps_are_marked() {
+        let v = parse_history(": 1700000000:0;cargo build\n", 0);
+        assert!(v[0].has_ts);
+
+        let v = parse_history("#1700000000\ngit status\n", 0);
+        assert!(v[0].has_ts, "bash 的 #ts 行之后的命令是有时间戳的");
     }
 
     #[test]

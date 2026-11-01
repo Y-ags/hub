@@ -671,6 +671,17 @@ fn daemon_status(data: &Path) -> Result<(), String> {
             st.merge_runs
         );
     }
+    if st.history_polls > 0 {
+        println!(
+            "终端历史：轮询 {} 次    最近入库：{}",
+            st.history_polls,
+            if st.last_history_at > 0 {
+                hub_daemon::human_time(st.last_history_at)
+            } else {
+                "（还没有新命令）".into()
+            }
+        );
+    }
     print_autostart(&autostart);
     println!("日志：{}", data.join("daemon.log").display());
     Ok(())

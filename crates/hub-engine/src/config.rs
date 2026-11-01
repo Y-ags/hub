@@ -13,6 +13,11 @@ pub struct EngineConfig {
     pub max_file_bytes: u64,
     /// 是否把终端历史也纳入
     pub with_history: bool,
+    /// 显式指定要采集的历史文件。为空时用平台默认位置（zsh / bash / PSReadLine）。
+    ///
+    /// 存在的理由不只是"可配置"：`ingest_history` 如果只会读全局默认路径，
+    /// 那它**没法被测试** —— 跑一次测试就会去索引开发机上真实的终端历史。
+    pub history_files: Vec<PathBuf>,
     /// 每多少篇文档提交一次。太小则 commit 次数过多（每次 commit 都要写段文件），
     /// 太大则内存里堆太多待写文档、崩溃时丢的多。
     pub batch: usize,
@@ -24,6 +29,7 @@ impl Default for EngineConfig {
             roots: Vec::new(),
             max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             with_history: false,
+            history_files: Vec::new(),
             batch: 500,
         }
     }

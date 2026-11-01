@@ -17,7 +17,7 @@ hub search 上个月写的那个rust内存相关的代码片段
 
 ```bash
 cargo build --release          # 首次约 2–5 分钟（Tantivy + bundled SQLite）
-cargo test                     # 86 条测试，全部离线可跑
+cargo test                     # 90 条测试，全部离线可跑
 
 ./target/release/hub daemon start ~/code ~/notes --history --autostart  # 一步到位
 ./target/release/hub daemon status                            # 看它在干什么
@@ -48,7 +48,7 @@ cargo test                     # 86 条测试，全部离线可跑
 ~/.hub/
 ├── meta.sqlite      水位表：content_hash / mtime / tombstone / doc_id（事实源）
 ├── index/           Tantivy 倒排（可重建，删了不心疼）
-├── daemon.conf      监听哪些目录、debounce / 对账 / 合并间隔
+├── daemon.conf      监听哪些目录、debounce / 对账 / 合并 / 历史轮询间隔
 ├── daemon.state     pid / 心跳 / 段数 / 累计统计
 └── daemon.log       后台日志（5MB 滚动）
 ```
@@ -93,6 +93,23 @@ daemon 每 3 小时（`merge_secs`）检查一次，在**距上次文件变更�
 
 判断依据是"段数 ≥ 8"或"有墓碑"，都没有就什么都不做（不会为了合并而重写文件）。
 
+### 终端历史：轮询而不是监听
+
+历史文件不归 watcher 管 —— watcher 监听的是你挑的目录，而 PSReadLine 的历史在
+`%APPDATA%\...\PSReadLine\` 下。为了它把整个 `%APPDATA%` 加进监听列表，会把上千个
+无关文件也索引进来。
+
+所以改成每 5 秒轮询（`history_poll_secs`）。代价可以忽略：
+
+| 情况 | 代价 |
+|---|---|
+| 文件没变（99% 的轮次） | 几次 `stat`，连解析都不做 |
+| 文件追加了一条命令 | 解析全文 + 只写那一条（已索引的靠内存集合挡掉） |
+| 冷启动（进程刚起） | 全解析一次，几千条历史约几百毫秒到几秒 |
+
+实测：11890 条 PowerShell 历史，首次入库 6326 条（重复命令自动去重）用时 4.4 秒；
+之后追加一条命令，2 秒内可搜到。
+
 ### 开机自启
 
 ```bash
@@ -115,7 +132,7 @@ hub daemon uninstall                  # 取消
 
 ```
 hub-cli         参数 / IO / 打印，不含检索逻辑也不含采集逻辑
-hub-daemon      常驻进程：watcher + debounce + 对账 + 空闲合并 + 自启 + 状态文件
+hub-daemon      常驻进程：watcher + debounce + 对账 + 空闲合并 + 历史轮询 + 自启
 hub-engine      采集流水线（scan_all / index_paths / remove_paths / reconcile）
 hub-store       MetaStore(SQLite) + HubIndex(Tantivy) + Indexer(胶水)
 hub-core        查询解析 / 中文分词 / BM25 / tombstone（零依赖）
@@ -173,6 +190,7 @@ hub-connectors  files / terminal 采集器（零依赖）
 | 给 source 加 `Must` 过滤就行 | **错**。外层有 `Must` 时 `Should` 变可选，同来源文档 0 分混入结果 |
 | "十" 可以跳过 | `cn_digit('十')` 是 `None`，收集循环会在"十"处断开：`十二个月前`→2 个月 |
 | 改文件时直接 `add_document` 就是"更新" | **错**。Tantivy 没有 upsert，旧文档变成僵尸：搜索结果按 doc_id 去重把它藏起来，`stats` 里"倒排中"才会露馅（实测 15 vs 存活 6）。写入前必须先 `delete_term(uri)` |
+| 历史条目的 uri 用 `mtime + 命令` 算 | 纯文本历史（PSReadLine）没有时间戳，mtime 一追加就变 → **整份历史的 uri 全变**，每轮重写几千条。无时间戳时只能按命令算 uri |
 
 ### 文件监听（`ReadDirectoryChangesW`）
 
@@ -195,15 +213,16 @@ hub-connectors  files / terminal 采集器（零依赖）
 - **非 UTF-8 文件直接跳过**（GBK 会变乱码，宁可漏不要脏）
 - **重排窗口 2000**：时间/来源惩罚在 BM25 之后做，超出窗口的文档不参与重排
 - **Windows 上索引目录被占用时删不掉**：`hub reset` 需要先 `hub daemon stop`
-- **终端历史只在启动时读一次**：历史文件追加后不实时更新（等下次重启或周期对账）
+- **终端历史每 5 秒轮询一次**（不是事件监听）：文件大小和 mtime 都没变时只花几次
+  `stat`；敲完命令到能搜到最多差 5 秒。`history_poll_secs=0` 可关掉
+- **历史条目常驻内存一份 uri 集合**：约 50 字节/条，10 万条历史约 5MB
 - **目录重命名会当成"删 + 增"**：内容没变也要重新分词一遍，正确但有开销
 
 ## 下一步
 
 ```
-1. 终端历史也纳入 watcher（现在只在启动/对账时读）
-2. hub-daemon ↔ CLI 的 IPC（现在靠状态文件，能读不能问）
-3. egui UI + global-hotkey
-4. 截图 OCR / 聊天记录 connector
-5. 真机内存基准（上线前必须做）
+1. hub-daemon ↔ CLI 的 IPC（现在靠状态文件，能读不能问）
+2. egui UI + global-hotkey
+3. 截图 OCR / 聊天记录 connector
+4. 真机内存基准（上线前必须做）
 ```

@@ -44,6 +44,14 @@ pub const DEFAULT_MERGE_IDLE_SECS: u64 = 120;
 /// 只有 1–2 个段时合并纯属重写一遍文件，没有任何收益。
 pub const DEFAULT_MERGE_MIN_SEGMENTS: usize = 8;
 
+/// 终端历史的检查间隔。默认 5 秒。
+///
+/// 历史文件不归 watcher 管（它监听的是用户选的目录，不是 `%APPDATA%`），
+/// 所以只能轮询。代价极低：文件大小和 mtime 都没变时，一次轮询只花几次 `stat`。
+/// 5 秒是"敲完命令切到搜索窗口就能搜到"的量级。
+/// 设为 0 表示只在启动时读一次（老行为）。
+pub const DEFAULT_HISTORY_POLL_SECS: u64 = 5;
+
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
     pub engine: EngineConfig,
@@ -56,6 +64,8 @@ pub struct DaemonConfig {
     pub merge_idle_secs: u64,
     /// 段数达到多少才因为段多而合并
     pub merge_min_segments: usize,
+    /// 多久检查一次终端历史文件。0 = 关闭轮询
+    pub history_poll_secs: u64,
 }
 
 impl Default for DaemonConfig {
@@ -68,6 +78,7 @@ impl Default for DaemonConfig {
             merge_secs: DEFAULT_MERGE_SECS,
             merge_idle_secs: DEFAULT_MERGE_IDLE_SECS,
             merge_min_segments: DEFAULT_MERGE_MIN_SEGMENTS,
+            history_poll_secs: DEFAULT_HISTORY_POLL_SECS,
         }
     }
 }
@@ -147,6 +158,11 @@ impl DaemonConfig {
                         cfg.merge_min_segments = n;
                     }
                 }
+                "history_poll_secs" => {
+                    if let Ok(n) = v.parse() {
+                        cfg.history_poll_secs = n;
+                    }
+                }
                 _ => {}
             }
         }
@@ -182,6 +198,7 @@ impl DaemonConfig {
         s.push_str(&format!("merge_secs={}\n", self.merge_secs));
         s.push_str(&format!("merge_idle_secs={}\n", self.merge_idle_secs));
         s.push_str(&format!("merge_min_segments={}\n", self.merge_min_segments));
+        s.push_str(&format!("history_poll_secs={}\n", self.history_poll_secs));
         std::fs::write(Self::conf_path(data), s)
     }
 }

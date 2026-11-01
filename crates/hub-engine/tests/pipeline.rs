@@ -191,3 +191,89 @@ fn remove_paths_marks_child_tree() {
     // 但 indexer 的 delete_under 已经把子树都清了
     assert_eq!(e.indexer().stats().unwrap().0, 0, "目录下所有文档都应消失");
 }
+
+// ============================================================
+// 终端历史（daemon 每 5 秒轮询一次，见 hub-daemon/src/lib.rs 第 6 步）
+// ============================================================
+
+/// 用临时文件当历史，避免测试去读开发机上真实的 shell 历史
+fn history_engine(data: &Path, hist: &Path) -> Engine {
+    Engine::open(
+        data,
+        EngineConfig {
+            with_history: true,
+            history_files: vec![hist.to_path_buf()],
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+/// 追加一条命令后，**只**索引新增的那条；文件没变时连解析都不做。
+#[test]
+fn history_append_indexes_only_new_entries() {
+    let t = tmp();
+    let hist = t.path().join("history.txt");
+    let data = t.path().join("data");
+    write(&hist, "cargo build --release\ngit status\n");
+
+    let mut e = history_engine(&data, &hist);
+    let r1 = e.ingest_history().unwrap();
+    assert_eq!(r1.indexed, 2, "首次应索引两条：{r1:?}");
+
+    // 文件没变 → (len, mtime) 快路径，一次 stat 就返回，连 parse 都不做
+    let r2 = e.ingest_history().unwrap();
+    assert_eq!((r2.indexed, r2.scanned), (0, 0), "文件没变不该重新解析：{r2:?}");
+
+    // 追加一条 → 全量解析，但只写新的
+    let mut text = fs::read_to_string(&hist).unwrap();
+    text.push_str("rustup target add aarch64-pc-windows-msvc\n");
+    fs::write(&hist, text).unwrap();
+
+    let r3 = e.ingest_history().unwrap();
+    assert_eq!(r3.indexed, 1, "只该写入新增那条：{r3:?}");
+    assert!(r3.scanned >= 3, "解析仍然要扫全量：{r3:?}");
+
+    let hits = e.search_text("aarch64-pc-windows-msvc", 5).unwrap();
+    assert_eq!(hits.len(), 1, "新命令应能搜到");
+}
+
+/// 纯文本历史的 uri 只由命令决定。别的工具 touch 一下文件（mtime 变、内容没变），
+/// 不该导致几千条历史被重写一遍 —— 修复前正是这个行为。
+#[test]
+fn history_touch_does_not_reindex() {
+    let t = tmp();
+    let hist = t.path().join("history.txt");
+    let data = t.path().join("data");
+    write(&hist, "cargo build --release\n");
+
+    let mut e = history_engine(&data, &hist);
+    assert_eq!(e.ingest_history().unwrap().indexed, 1);
+
+    // 只改 mtime，不碰内容
+    let f = fs::OpenOptions::new().append(true).open(&hist).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(30))
+        .unwrap();
+    drop(f);
+
+    let rep = e.ingest_history().unwrap();
+    assert_eq!(rep.scanned, 1, "mtime 变了要重新解析");
+    assert_eq!(rep.indexed, 0, "但内容没变，不该重写索引：{rep:?}");
+}
+
+/// 同一条命令敲很多次只留一条 —— 这是"纯文本历史按命令去重"的副作用，
+/// 也是想要的：PSReadLine 历史里 60% 是重复命令，全索引进来只会稀释排序。
+#[test]
+fn repeated_commands_collapse_to_one() {
+    let t = tmp();
+    let hist = t.path().join("history.txt");
+    let data = t.path().join("data");
+    write(&hist, "cargo test\ncargo test\ncargo test\n");
+
+    let mut e = history_engine(&data, &hist);
+    let rep = e.ingest_history().unwrap();
+    assert_eq!(rep.indexed, 1, "同一条命令只索引一次：{rep:?}");
+
+    let hits = e.search_text("cargo test", 10).unwrap();
+    assert_eq!(hits.len(), 1, "搜索也只该出一条：{hits:?}");
+}

@@ -31,6 +31,10 @@ pub struct State {
     pub merge_runs: usize,
     /// 最近一次观测到的索引段数（不合并也更新，用来判断"该不该合"）
     pub segments: usize,
+    /// 终端历史最后一次有新条目入库的时间
+    pub last_history_at: i64,
+    /// 终端历史轮询了多少次（大多数轮次什么都没做 —— 这正是它便宜的证据）
+    pub history_polls: u64,
     /// 主循环轮次，用来判断进程是"活着但卡住"还是"根本没在跑"
     pub ticks: u64,
     pub roots: Vec<String>,
@@ -93,7 +97,7 @@ impl State {
             "pid={}\nstarted_at={}\nheartbeat_at={}\nlast_event_at={}\n\
              last_reconcile_at={}\nindexed_total={}\ndeleted_total={}\n\
              reconcile_runs={}\nlast_merge_at={}\nmerge_runs={}\nsegments={}\n\
-             ticks={}\nroots={}\n",
+             last_history_at={}\nhistory_polls={}\nticks={}\nroots={}\n",
             self.pid,
             self.started_at,
             self.heartbeat_at,
@@ -105,6 +109,8 @@ impl State {
             self.last_merge_at,
             self.merge_runs,
             self.segments,
+            self.last_history_at,
+            self.history_polls,
             self.ticks,
             roots
         )
@@ -128,6 +134,8 @@ impl State {
                 "last_merge_at" => s.last_merge_at = v.trim().parse().unwrap_or(0),
                 "merge_runs" => s.merge_runs = v.trim().parse().unwrap_or(0),
                 "segments" => s.segments = v.trim().parse().unwrap_or(0),
+                "last_history_at" => s.last_history_at = v.trim().parse().unwrap_or(0),
+                "history_polls" => s.history_polls = v.trim().parse().unwrap_or(0),
                 "ticks" => s.ticks = v.trim().parse().unwrap_or(0),
                 "roots" => {
                     s.roots = v

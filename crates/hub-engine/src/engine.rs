@@ -1,6 +1,6 @@
 //! 采集流水线实现。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
@@ -130,6 +130,12 @@ pub struct Engine {
     indexer: Indexer,
     cfg: EngineConfig,
     opts: WalkOptions,
+    /// 每个历史文件上次见到的 (字节数, mtime)。一样就完全不用解析 ——
+    /// 用户不敲命令时，轮询的代价只是几次 stat。
+    history_stamp: HashMap<PathBuf, (u64, i64)>,
+    /// 已经写进索引的历史条目 uri。终端历史动辄几千条，每轮为每条查一次
+    /// SQLite 是纯浪费；这个集合让重复条目在内存里就被挡掉。
+    history_seen: HashSet<String>,
 }
 
 impl Engine {
@@ -139,7 +145,13 @@ impl Engine {
             max_file_bytes: cfg.max_bytes(),
             ..Default::default()
         };
-        Ok(Self { indexer, cfg, opts })
+        Ok(Self {
+            indexer,
+            cfg,
+            opts,
+            history_stamp: HashMap::new(),
+            history_seen: HashSet::new(),
+        })
     }
 
     pub fn cfg(&self) -> &EngineConfig {
@@ -437,43 +449,100 @@ impl Engine {
         Ok(rep)
     }
 
-    /// 终端历史。幂等：uri 由 (时间戳+命令) 的哈希决定，历史文件追加内容时旧条目不变。
+    /// 终端历史。幂等：uri 只由内容和时间决定，历史文件追加内容时旧条目不变。
+    ///
+    /// daemon 会**周期性**调它（用户敲完命令几秒内就该能搜到），所以两条快路径
+    /// 是必须的：
+    /// 1. 文件大小 + mtime 都没变 → 连读取和解析都跳过，只花一次 stat
+    /// 2. 条目已经在 `history_seen` 里 → 不查库、不入队
+    ///
+    /// 没有第 2 条的话，每轮都要为几千条历史各做一次 SQLite 查询。
     pub fn ingest_history(&mut self) -> hub_store::Result<IngestReport> {
         let started = Instant::now();
         let mut rep = IngestReport::default();
 
-        for f in default_history_files() {
+        // 配置里指定了就用指定的，否则用平台默认位置（zsh / bash / PSReadLine）
+        let files = if self.cfg.history_files.is_empty() {
+            default_history_files()
+        } else {
+            self.cfg.history_files.clone()
+        };
+
+        for f in files {
+            let stamp = match fs::metadata(&f) {
+                Ok(m) => (m.len(), mtime_of(&f)),
+                Err(_) => continue,
+            };
+            if self.history_stamp.get(&f) == Some(&stamp) {
+                continue;
+            }
+
             let text = match read_text(&f, 32 * 1024 * 1024) {
                 Ok(Some(t)) => t,
                 _ => continue,
             };
-            let file_mtime = mtime_of(&f);
+            let file_mtime = stamp.1;
+            let file_uri = to_uri(&f);
 
             for e in parse_history(&text, file_mtime) {
                 if is_noise(&e.cmd) {
                     continue;
                 }
                 rep.scanned += 1;
-                let stamp = format!("{}:{}", e.ts, e.cmd);
-                let uri = format!(
-                    "terminal://{}/{:016x}",
-                    to_uri(&f),
-                    hash_bytes(stamp.as_bytes())
-                );
-                if !self.indexer.needs_read(SourceId::Terminal, &uri, e.ts)? {
+
+                // 有真实时间戳（zsh / bash）→ 条目由 (时间, 命令) 唯一标识。
+                // 纯文本历史（PSReadLine）没有时间戳 → **只按命令去重**。
+                //
+                // 后者不是偷懒：拿 mtime 兜底再参与 uri，文件每追加一条命令
+                // mtime 就变，整份历史的 uri 全部改变，于是每轮都把几千条
+                // 重写一遍。副作用（同一命令只留一条）恰好也是我们想要的。
+                let uri = if e.has_ts {
+                    let key = format!("{}:{}", e.ts, e.cmd);
+                    format!("terminal://{file_uri}/{:016x}", hash_bytes(key.as_bytes()))
+                } else {
+                    format!("terminal://{file_uri}/{:016x}", hash_bytes(e.cmd.as_bytes()))
+                };
+
+                if self.history_seen.contains(&uri) {
                     rep.skipped += 1;
                     continue;
                 }
+
+                let known = if e.has_ts {
+                    // 冷启动时内存集合是空的，靠水位表挡：mtime 相同就别读了
+                    !self.indexer.needs_read(SourceId::Terminal, &uri, e.ts)?
+                } else {
+                    // 纯文本条目不能比 mtime —— 它的 mtime 就是会变的文件 mtime。
+                    // 存在即视为无需更新，时间保留第一次见到的那次。
+                    self.indexer
+                        .meta()
+                        .lookup(SourceId::Terminal, &uri)?
+                        .map(|r| r.live)
+                        .unwrap_or(false)
+                };
+                if known {
+                    self.history_seen.insert(uri);
+                    rep.skipped += 1;
+                    continue;
+                }
+
                 let title: String = e.cmd.lines().next().unwrap_or("").chars().take(80).collect();
-                if self.indexer.add(SourceId::Terminal, &uri, title, e.cmd.clone(), e.ts)? {
+                if self
+                    .indexer
+                    .add(SourceId::Terminal, &uri, title, e.cmd.clone(), e.ts)?
+                {
+                    self.history_seen.insert(uri);
                     // 历史条目量可能上万，边加边提交
                     if self.indexer.pending_len() >= self.cfg.batch {
                         rep.indexed += self.indexer.flush()?;
                     }
                 } else {
+                    self.history_seen.insert(uri);
                     rep.skipped += 1;
                 }
             }
+            // 只有整份文件解析完才记下 stamp：中途出错下次还要重来
+            self.history_stamp.insert(f, stamp);
         }
 
         rep.indexed += self.indexer.flush()?;

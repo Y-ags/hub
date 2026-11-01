@@ -161,12 +161,20 @@ impl Daemon {
         let heartbeat_every = Duration::from_secs(self.cfg.heartbeat_secs.max(1));
         let merge_every = Duration::from_secs(self.cfg.merge_secs.max(5));
         let merge_idle = Duration::from_secs(self.cfg.merge_idle_secs);
+        // 只开了 with_history 才轮询：没开的人不该为一份不采集的数据付 stat 成本
+        let history_poll = if self.cfg.engine.with_history && self.cfg.history_poll_secs > 0 {
+            Some(Duration::from_secs(self.cfg.history_poll_secs.max(1)))
+        } else {
+            None
+        };
 
         let mut pending: BTreeSet<PathBuf> = BTreeSet::new();
         let mut buf: Vec<FsEvent> = Vec::new();
         let mut last_evt = Instant::now();
         let mut next_reconcile = Instant::now() + reconcile_every;
         let mut next_heartbeat = Instant::now() + heartbeat_every;
+        let mut next_history =
+            Instant::now() + history_poll.unwrap_or(Duration::from_secs(3600));
         // 冷启动刚扫完，段可能已经积了一堆（旧版本留下的，或者停机期间攒的）。
         // 这种一次性的堆积不该再等一个完整周期，给它 15 秒就收拾掉。
         self.state.segments = self.engine.segment_count();
@@ -296,7 +304,33 @@ impl Daemon {
                 // 内存比较，比"推迟 5 分钟"精确得多（推迟会整整错过一个空窗）
             }
 
-            // ---- 6. 心跳 ----
+            // ---- 6. 终端历史轮询 ----
+            //
+            // 历史文件不归 watcher 管：watcher 监听的是用户挑的目录，而
+            // PSReadLine 的历史在 `%APPDATA%\...\PSReadLine\` 下。为它把整个
+            // APPDATA 加进 roots 会把上千个无关文件也索引进来。
+            //
+            // 所以改成轮询。代价可以忽略 —— 文件大小和 mtime 都没变时，
+            // Engine 内部直接返回，一次轮询只是几次 stat。
+            if let Some(every) = history_poll {
+                let hnow = Instant::now();
+                if hnow >= next_history {
+                    next_history = hnow + every;
+                    self.state.history_polls += 1;
+                    match self.engine.ingest_history() {
+                        Ok(rep) => {
+                            if rep.churned() {
+                                self.apply(&rep, "终端历史");
+                                self.state.last_history_at = now_secs();
+                                let _ = self.state.save(&self.data);
+                            }
+                        }
+                        Err(e) => self.log.error(format!("终端历史采集失败：{e}")),
+                    }
+                }
+            }
+
+            // ---- 7. 心跳 ----
             let now = Instant::now();
             if now >= next_heartbeat {
                 next_heartbeat = now + heartbeat_every;
