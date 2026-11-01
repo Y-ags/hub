@@ -17,7 +17,7 @@ hub search 上个月写的那个rust内存相关的代码片段
 
 ```bash
 cargo build --release          # 首次约 2–5 分钟（Tantivy + bundled SQLite）
-cargo test                     # 117 条测试，全部离线可跑
+cargo test                     # 123 条测试，全部离线可跑
 
 ./target/release/hub daemon start ~/code ~/notes --history --autostart  # 一步到位
 ./target/release/hub daemon status                            # 看它在干什么
@@ -209,6 +209,21 @@ $ hub search 零拷贝
 命中 3 条，0.9 ms（经 daemon）
 ```
 
+`hub stats` 现在也走这条路。它原本自己 `Indexer::open`，而那是**可写**打开
+（`MetaStore::open` 要跑迁移），于是 daemon 常驻之后每跑一次 stats 就多一个写者。
+现在 IPC 线程用一条 `SQLITE_OPEN_READONLY` 连接读同一个库：
+
+```
+$ hub stats
+存活文档：6372    墓碑：0    倒排中：6372    段：16    （实时，来自 daemon）
+```
+
+只读是**数据库层面**的约束而不是自觉 —— 以后谁在这条路径上加了写语句，测试会立刻炸。
+顺带的好处是数字跟 daemon 实时一致：新建一个文件，stats 不用等任何东西就能看到。
+
+实测 6372 篇：走 IPC 73–80ms / 15.5MB，走本地 105–113ms / 16.8MB。
+30ms 不是重点，重点是不再碰索引目录。
+
 **连不上就静默退回本地**：daemon 没在跑、协议版本对不上（升级后旧进程还在）、
 3 秒没响应，三种情况都走原来那条路。用户不该因为后台进程的状态而改变命令用法。
 `--local` 可以强制走本地。
@@ -344,13 +359,14 @@ hub-connectors  files / terminal 采集器（零依赖）
   `stat`；敲完命令到能搜到最多差 5 秒。`history_poll_secs=0` 可关掉
 - **历史条目常驻内存一份 uri 集合**：约 50 字节/条，10 万条历史约 5MB
 - **目录重命名会当成"删 + 增"**：内容没变也要重新分词一遍，正确但有开销
-- **IPC 只回答 search**：`stats` / `index` 仍走本地。`hub index` 与 daemon 同时写
-  目前靠"内容哈希判定 + SQLite busy_timeout"共存，没有严格串行化
+- **IPC 只回答 search / stats**：`hub index`、`hub merge`、`hub repl` 仍直接打开索引。
+  前两个按定义就是写者，第三个是一个长会话。`hub index` 与 daemon 同时写目前靠
+  "内容哈希判定 + SQLite busy_timeout"共存，没有严格串行化
 
 ## 下一步
 
 ```
-1. IPC 扩到 stats / index（现在这两个仍走本地连接）
-2. 截图 OCR / 聊天记录 connector
-3. Linux / macOS 版界面（IME 在 GTK/Qt 上是现成的，成本比 Windows 低）
+1. 截图 OCR / 聊天记录 connector
+2. Linux / macOS 版界面（IME 在 GTK/Qt 上是现成的，成本比 Windows 低）
+3. 私有字节口径的内存基准（现在报的是工作集，含 mmap 页）
 ```

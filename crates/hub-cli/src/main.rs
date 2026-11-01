@@ -34,7 +34,7 @@ hub —— 本地离线多源个人检索中枢
 索引维护:
   hub index <目录>... [--history] [--max-mb N] [--reset]
         手动全量扫描（daemon 在跑时通常不需要）
-  hub stats        查看索引规模与来源分布
+  hub stats        查看索引规模与来源分布（daemon 在跑时问它，数字是实时的）
   hub merge        回收已删文档占用的倒排空间
   hub reset --yes  清空索引与水位表（破坏性操作）
 
@@ -969,12 +969,57 @@ fn spawn_ui_background(data: &Path, hotkey: Option<&str>) -> Result<(), String> 
     Ok(())
 }
 
+/// `hub stats` —— 索引规模，先问 daemon，问不到自己算。
+///
+/// 为什么要绕这一圈：`Indexer::open` 会顺带把水位表**以可写方式**打开
+/// （`MetaStore::open` 要做迁移）。daemon 在跑的时候，这就成了第二个写者，
+/// 两边撞上写锁时谁先谁后看运气。而 stats 只需要读。
+///
+/// 所以顺序是：先走 IPC（daemon 那边是一条只读连接，永不可能变成写者），
+/// 连不上再退回本地 —— 这时 daemon 多半没在跑，也就不存在争用。
 fn cmd_stats(data: &Path) -> Result<(), String> {
+    if let Some(s) = daemon_stats(data) {
+        println!("数据目录：{}", data.display());
+        println!(
+            "存活文档：{}    墓碑：{}    倒排中：{}    段：{}    （实时，来自 daemon）",
+            s.live, s.tombstones, s.num_docs, s.segments
+        );
+        print_sources(&s.by_source);
+        if s.tombstones > 0 {
+            println!("\n有 {} 条墓碑，daemon 空闲时会自己合并；急的话 hub merge", s.tombstones);
+        }
+        return Ok(());
+    }
+
     let indexer = Indexer::open(data).map_err(|e| format!("打开数据目录失败：{e}"))?;
     let (live, tombs, docs, by_source) = indexer.stats().map_err(|e| e.to_string())?;
+    let segments = indexer.segment_count();
 
     println!("数据目录：{}", data.display());
-    println!("存活文档：{live}    墓碑：{tombs}    倒排中：{docs}");
+    println!("存活文档：{live}    墓碑：{tombs}    倒排中：{docs}    段：{segments}");
+    print_sources(&by_source);
+    if tombs > 0 {
+        println!("\n有 {tombs} 条墓碑，运行 hub merge 回收空间");
+    }
+    Ok(())
+}
+
+/// 问 daemon 要统计。`None` = 这条走不通，退回本地。
+///
+/// 和 `daemon_search` 一样，所有失败都收敛成 `None`：daemon 在不在跑
+/// 是环境细节，不该让 `hub stats` 从"能看"变成"报错"。
+fn daemon_stats(data: &Path) -> Option<hub_daemon::ipc::StatsReply> {
+    use hub_daemon::ipc;
+
+    let mut c = ipc::Client::connect(data).ok()?;
+    // 版本先对一次：旧 daemon 的 stats 响应字段数可能不一样
+    if c.ping().ok()?.proto != ipc::PROTO {
+        return None;
+    }
+    c.stats().ok()
+}
+
+fn print_sources(by_source: &[(String, usize)]) {
     if by_source.is_empty() {
         println!("来源分布：（空）");
     } else {
@@ -983,10 +1028,6 @@ fn cmd_stats(data: &Path) -> Result<(), String> {
             println!("  {src:<10} {n}");
         }
     }
-    if tombs > 0 {
-        println!("\n有 {tombs} 条墓碑，运行 hub merge 回收空间");
-    }
-    Ok(())
 }
 
 fn cmd_merge(data: &Path) -> Result<(), String> {

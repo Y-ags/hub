@@ -85,6 +85,41 @@ impl MetaStore {
         Ok(Self { conn })
     }
 
+    /// 只读打开，给"只看不动"的读者用（daemon 的 IPC 线程回答 `stats`）。
+    ///
+    /// 两处和 `open` 不同：
+    ///
+    /// 1. **不做迁移**。`open` 里那批 `CREATE TABLE IF NOT EXISTS` 在只读连接上
+    ///    会直接失败；更重要的是语义 —— 用 `SQLITE_OPEN_READONLY` 打开之后，
+    ///    这条连接在数据库层面就写不了，以后谁加了写语句，测试里立刻炸，
+    ///    而不是在生产里悄悄变成第二个写者。
+    /// 2. **不建库**。flags 里**没有** `SQLITE_OPEN_CREATE`（`open` 那套
+    ///    `Connection::open` 是 `READ_WRITE | CREATE`）。实测确认过：库不存在时
+    ///    SQLite 返回的是 `unable to open database file`，**不会**顺手造一个
+    ///    空库。下面那个 `exists()` 预检不是为了防这个，只是为了让报错说清楚
+    ///    "该去建库"还是"权限不对" —— SQLite 自己那句话两种原因长得一样。
+    ///
+    /// WAL 的注意点：SQLite 要求打开 WAL 库的进程对 `-shm` 有写权限（那是进程间
+    /// 共享的索引结构，不是数据）。同一用户的普通进程都满足，所以这里不特殊处理；
+    /// 真在只读介质上会返回错误，调用方的正确反应是退回本地打开索引。
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(crate::StoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("元数据库不存在：{}", path.display()),
+            )));
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        // 只读连接一样会和写者撞锁（WAL 下读者不阻塞写者，但 checkpoint 会），
+        // 撞上时别立刻甩 SQLITE_BUSY 给上层
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        Ok(Self { conn })
+    }
+
     pub fn open_in_memory() -> Result<Self> {
         Self::open(":memory:")
     }
@@ -350,6 +385,51 @@ mod tests {
             content_hash: hash,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn readonly_refuses_to_create_a_missing_db() {
+        let t = tempfile::TempDir::new().unwrap();
+        let p = t.path().join("meta.sqlite");
+        // `unwrap_err` 要求 Ok 那边是 Debug，MetaStore 没实现（也不该为
+        // 了一条测试去实现），所以直接 match
+        let e = match MetaStore::open_readonly(&p) {
+            Ok(_) => panic!("库不存在时不该返回成功"),
+            Err(e) => e,
+        };
+        // 断言"文件仍然不存在"而不是只断言报错：只读打开真正的风险是
+        // flags 里混进了 CREATE —— 那样报错是没有的，它只是安静地造了个空库，
+        // 之后 `hub stats` 会一路显示 0 篇，看起来像"索引丢了"
+        assert!(!p.exists(), "只读打开不该创建文件");
+        assert!(matches!(e, crate::StoreError::Io(_)), "{e}");
+    }
+
+    #[test]
+    fn readonly_connection_reads_but_cannot_write() {
+        let t = tempfile::TempDir::new().unwrap();
+        let p = t.path().join("meta.sqlite");
+
+        // 写者**不** drop：daemon 一边握可写连接、IPC 线程一边用只读连接，
+        // 这才是生产里的样子。WAL 下多读一写是设计内的用法
+        let w = MetaStore::open(&p).unwrap();
+        w.upsert(&doc(1, 42, 1000), 1_700_000_000).unwrap();
+
+        let r = MetaStore::open_readonly(&p).unwrap();
+        assert_eq!(r.count_live().unwrap(), 1);
+        assert_eq!(r.count_by_source().unwrap(), vec![("files".to_string(), 1)]);
+        // 只读那边看到的和写者写的是同一份
+        assert!(r.lookup(SourceId::Files, "C:/tmp/a.rs").unwrap().is_some());
+
+        // 关键性质：这条连接在数据库层面就写不了。以后谁加了写语句，
+        // 测试里立刻炸，而不是在生产里悄悄变成第二个写者
+        let e = r.upsert(&doc(2, 43, 2000), 1_700_000_000).unwrap_err();
+        let msg = e.to_string().to_lowercase();
+        assert!(
+            msg.contains("readonly") || msg.contains("read-only"),
+            "只读连接必须写不进去，实际报错：{e}"
+        );
+        assert_eq!(r.count_live().unwrap(), 1, "写了失败，数字不该变");
+        assert_eq!(w.count_live().unwrap(), 1);
     }
 
     #[test]

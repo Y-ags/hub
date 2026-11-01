@@ -24,7 +24,7 @@ pub mod meta;
 use std::fmt;
 
 pub use index::{Hit, HubIndex, HUB_BIGRAM, HUB_WORD};
-pub use indexer::{Indexer, IndexerStats};
+pub use indexer::{meta_path, Indexer, IndexerStats, META_FILE};
 pub use meta::{MetaRow, MetaStore};
 
 /// 存储层统一错误。混用 tantivy::Result 和 rusqlite::Result 会让上层写出一堆

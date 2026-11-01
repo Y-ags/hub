@@ -72,6 +72,18 @@ pub fn hash_bytes(bytes: &[u8]) -> u64 {
     h
 }
 
+/// 水位表的文件名。
+///
+/// 抽成常量是因为**已经不止 `Indexer` 一个人用它**：daemon 的 IPC 线程要用
+/// 只读连接打开同一个库来回答 `stats`。两处各写一遍字面量，改名的那个下午
+/// 就会变成"stats 说元数据库不存在"。
+pub const META_FILE: &str = "meta.sqlite";
+
+/// `<data>/meta.sqlite`
+pub fn meta_path(dir: impl AsRef<Path>) -> std::path::PathBuf {
+    dir.as_ref().join(META_FILE)
+}
+
 impl Indexer {
     /// 打开（或创建）数据目录。目录结构：
     /// ```text
@@ -81,7 +93,7 @@ impl Indexer {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
-        let meta = MetaStore::open(dir.join("meta.sqlite"))?;
+        let meta = MetaStore::open(meta_path(dir))?;
         let index = Arc::new(HubIndex::open_or_create(dir.join("index"))?);
         Ok(Self {
             meta,
@@ -97,9 +109,11 @@ impl Indexer {
     /// 必须先于 `open` 调用：Windows 上被 mmap 的段文件删不掉。
     pub fn reset(dir: impl AsRef<Path>) -> Result<()> {
         let dir = dir.as_ref();
-        let meta_path = dir.join("meta.sqlite");
-        if meta_path.exists() {
-            let meta = MetaStore::open(&meta_path)?;
+        // 变量名别叫 meta_path —— 会和上面那个函数同名，靠"初始化表达式里
+        // 还看得见外层"这条规则才能编过，读的人得停下来想一秒
+        let mp = meta_path(dir);
+        if mp.exists() {
+            let meta = MetaStore::open(&mp)?;
             meta.clear()?;
             drop(meta);
         }

@@ -54,7 +54,7 @@ use std::thread::JoinHandle;
 
 use hub_core::SourceId;
 use hub_store::index::Hit;
-use hub_store::HubIndex;
+use hub_store::{HubIndex, MetaStore};
 
 use crate::log::Log;
 
@@ -252,6 +252,85 @@ pub fn parse_search_reply(payload: &str) -> Result<SearchReply, String> {
     Ok(SearchReply { hits, num_docs })
 }
 
+/// `stats` 的回应。
+///
+/// 四个数字来自**两个不同的地方**，这一点是有意的：
+/// `live` / `tombstones` / `by_source` 是事实源（SQLite 水位表），
+/// `num_docs` / `segments` 是可重建的索引缓存（Tantivy）。
+/// 两者**不保证随时相等** —— 刚标记删除、还没 commit 的那一瞬间，
+/// 水位表已经把行改成 tombstone，倒排里还留着文档。`hub stats` 的价值
+/// 恰恰是让人看见这个差，而不是假装它们总是一致。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsReply {
+    pub live: usize,
+    pub tombstones: usize,
+    pub num_docs: usize,
+    pub segments: usize,
+    /// (来源名, 存活数)，按数量降序
+    pub by_source: Vec<(String, usize)>,
+}
+
+pub fn encode_stats() -> String {
+    "stats".to_string()
+}
+
+pub fn encode_stats_reply(s: &StatsReply) -> String {
+    let mut out = format!(
+        "ok\t{}\t{}\t{}\t{}\n",
+        s.live, s.tombstones, s.num_docs, s.segments
+    );
+    for (src, n) in &s.by_source {
+        out.push_str(&format!("{}\t{n}\n", esc(src)));
+    }
+    out
+}
+
+pub fn parse_stats_reply(payload: &str) -> Result<StatsReply, String> {
+    let mut lines = payload.lines();
+    let head = lines.next().ok_or_else(|| "响应为空".to_string())?;
+    let f: Vec<&str> = head.split('\t').collect();
+    if f.first().copied() == Some("err") {
+        return Err(unesc(f.get(1).copied().unwrap_or("对端没有给出原因")));
+    }
+    if f.first().copied() != Some("ok") {
+        return Err(format!(
+            "不认识的开头 `{}`（协议版本不一致？）",
+            f.first().copied().unwrap_or("")
+        ));
+    }
+    let num = |i: usize, what: &str| -> Result<usize, String> {
+        f.get(i)
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| format!("stats 响应缺少{what}"))
+    };
+    let live = num(1, "存活数")?;
+    let tombstones = num(2, "墓碑数")?;
+    let num_docs = num(3, "倒排文档数")?;
+    let segments = num(4, "段数")?;
+
+    // 来源行**不可能**是空的：索引里只要有文档就至少有一个来源。
+    // 但"空索引"是合法的，所以要允许 0 行，不能按行数做断言
+    let mut by_source = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let p: Vec<&str> = line.split('\t').collect();
+        if p.len() < 2 {
+            return Err(format!("来源行字段不足（{} 个）", p.len()));
+        }
+        let n: usize = p[1].parse().map_err(|_| "来源计数不是整数".to_string())?;
+        by_source.push((unesc(p[0]), n));
+    }
+    Ok(StatsReply {
+        live,
+        tombstones,
+        num_docs,
+        segments,
+        by_source,
+    })
+}
+
 /// `ping` 的回应
 #[derive(Debug, Clone)]
 pub struct Pong {
@@ -299,11 +378,30 @@ impl Server {
         let mut listener = platform::Listen::bind(&endpoint)?;
         let stop = Arc::new(AtomicBool::new(false));
 
+        // 水位表用**只读连接**打开，而且在这一条线程里独占。
+        //
+        // 为什么不是把主循环的 `MetaStore` 共享过来：rusqlite 的 `Connection`
+        // 是 `Send` 但不是 `Sync`，要共享就得套 `Mutex`，那样 IPC 查一次
+        // stats 会让主循环的 commit 等一次锁 —— 为一个每秒几十次的查询
+        // 去干扰写路径，方向反了。WAL 本来就是「多读一写」，多一条只读
+        // 连接是它设计内的用法。
+        //
+        // 打不开也不致命：`stats` 会返回 err，CLI 退回本地自己算。
         let flag = stop.clone();
+        let meta_path = hub_store::meta_path(data);
         let thread = std::thread::Builder::new()
             .name("hub-ipc".into())
             .spawn(move || {
                 let mut log = log;
+                let meta = match MetaStore::open_readonly(&meta_path) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        // 只影响 `stats` 这一个动词（CLI 会退回本地自己算），
+                        // 但这是肉眼可见的降级，值得在日志里留一行
+                        log.warn(format!("stats 动词不可用（只读打开水位表失败）：{e}"));
+                        None
+                    }
+                };
                 // accept 的错误不能把线程打死，但也不能无限刷日志：
                 // 连续失败时退避，成功一次就归零
                 let mut backoff = 0u32;
@@ -311,7 +409,7 @@ impl Server {
                     match listener.accept() {
                         Ok(conn) => {
                             backoff = 0;
-                            serve(conn, &index, started_at);
+                            serve(conn, &index, meta.as_ref(), started_at);
                         }
                         Err(e) => {
                             if flag.load(Ordering::Relaxed) {
@@ -367,18 +465,23 @@ impl Drop for Server {
     }
 }
 
-fn serve(mut conn: platform::Conn, index: &HubIndex, started_at: i64) {
+fn serve(mut conn: platform::Conn, index: &HubIndex, meta: Option<&MetaStore>, started_at: i64) {
     // 一条连接可以问多次：客户端问完就关，但服务端这里照样循环，
     // 省得为"一次连接一次问答"额外写状态机
     while let Ok(payload) = read_frame(&mut conn) {
-        let reply = handle(&payload, index, started_at);
+        let reply = handle(&payload, index, meta, started_at);
         if write_frame(&mut conn, reply.as_bytes()).is_err() {
             break;
         }
     }
 }
 
-fn handle(payload: &[u8], index: &HubIndex, started_at: i64) -> String {
+fn handle(
+    payload: &[u8],
+    index: &HubIndex,
+    meta: Option<&MetaStore>,
+    started_at: i64,
+) -> String {
     let req = match std::str::from_utf8(payload) {
         Ok(s) => s,
         Err(_) => return "err\t请求不是 UTF-8".to_string(),
@@ -407,6 +510,31 @@ fn handle(payload: &[u8], index: &HubIndex, started_at: i64) -> String {
             match index.search_text(&q, k, crate::now_secs()) {
                 Ok(hits) => encode_search_reply(&hits, index.num_docs()),
                 Err(e) => format!("err\t检索失败：{e}"),
+            }
+        }
+        "stats" => {
+            // 水位表打不开时不能编数字：`hub stats` 的用途就是让人看清
+            // "存活的/墓碑的/倒排里的"三者差多少，缺一个就会给出误导性的
+            // 结论。宁可报错让 CLI 退回本地自己算
+            let Some(meta) = meta else {
+                return "err\t水位表不可读，请退回本地打开索引".to_string();
+            };
+            let counts = (|| -> Result<(usize, usize, Vec<(String, usize)>), String> {
+                Ok((
+                    meta.count_live().map_err(|e| e.to_string())?,
+                    meta.count_tombstone().map_err(|e| e.to_string())?,
+                    meta.count_by_source().map_err(|e| e.to_string())?,
+                ))
+            })();
+            match counts {
+                Ok((live, tombstones, by_source)) => encode_stats_reply(&StatsReply {
+                    live,
+                    tombstones,
+                    num_docs: index.num_docs(),
+                    segments: index.segment_count(),
+                    by_source,
+                }),
+                Err(e) => format!("err\t读水位表失败：{e}"),
             }
         }
         "" => "err\t空请求".to_string(),
@@ -447,6 +575,13 @@ impl Client {
     pub fn ping(&mut self) -> io::Result<Pong> {
         let resp = self.call(&encode_ping())?;
         parse_pong(&resp).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+
+    /// 问一下索引规模。daemon 不在跑、或它的水位表打不开时返回错误 ——
+    /// 调用方的正确反应是自己打开索引算一遍，不是报错给用户看。
+    pub fn stats(&mut self) -> io::Result<StatsReply> {
+        let resp = self.call(&encode_stats())?;
+        parse_stats_reply(&resp).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 }
 
@@ -936,6 +1071,146 @@ mod tests {
         }
 
         srv.stop();
+    }
+
+    #[test]
+    fn stats_works_while_the_writer_connection_is_still_open() {
+        let t = tempfile::TempDir::new().unwrap();
+        let data = t.path().join("data");
+
+        // 关键：**不** drop 这个 Indexer。生产里 daemon 一直握着可写连接，
+        // 而 IPC 线程那一条是只读的 —— 两者必须在同一个库上同时活着。
+        // 这也正是"给 stats 加 IPC"的全部动机：CLI 别再开第三个连接。
+        let mut ix = hub_store::Indexer::open(&data).unwrap();
+        ix.add(
+            SourceId::Files,
+            "files/a.md",
+            "笔记 A".into(),
+            "零拷贝 mmap".into(),
+            1_700_000_000,
+        )
+        .unwrap();
+        ix.add(
+            SourceId::Files,
+            "files/b.md",
+            "笔记 B".into(),
+            "another 零拷贝".into(),
+            1_700_000_010,
+        )
+        .unwrap();
+        ix.add(
+            SourceId::Terminal,
+            "terminal://bash/9",
+            "history".into(),
+            "cargo test".into(),
+            1_700_000_020,
+        )
+        .unwrap();
+        ix.flush().unwrap();
+
+        let mut srv = Server::start(&data, ix.index_handle(), 0, Log::silent()).unwrap();
+        {
+            let mut c = Client::connect(&data).unwrap();
+            let s = c.stats().unwrap();
+            assert_eq!(s.live, 3, "三个存活文档：{s:?}");
+            assert_eq!(s.tombstones, 0);
+            assert_eq!(s.num_docs, 3);
+            assert!(s.segments >= 1, "至少一个段：{s:?}");
+
+            let files = s.by_source.iter().find(|(n, _)| n == "files").unwrap();
+            let term = s.by_source.iter().find(|(n, _)| n == "terminal").unwrap();
+            assert_eq!(files.1, 2);
+            assert_eq!(term.1, 1);
+            // 按数量降序：2 条的那个必须排在 1 条的前面
+            assert_eq!(s.by_source[0].0, "files", "来源应按数量降序：{s:?}");
+        }
+
+        // 写者在旁边继续写，只读那边看到的数字要跟着变
+        ix.add(
+            SourceId::Files,
+            "files/c.md",
+            "笔记 C".into(),
+            "第三篇".into(),
+            1_700_000_030,
+        )
+        .unwrap();
+        ix.flush().unwrap();
+        {
+            let mut c = Client::connect(&data).unwrap();
+            let s = c.stats().unwrap();
+            assert_eq!(s.live, 4, "新增之后应立刻看得到：{s:?}");
+            assert_eq!(s.num_docs, 4);
+        }
+
+        srv.stop();
+    }
+
+    #[test]
+    fn stats_reports_tombstones() {
+        let t = tempfile::TempDir::new().unwrap();
+        let data = t.path().join("data");
+        let mut ix = hub_store::Indexer::open(&data).unwrap();
+        ix.add(
+            SourceId::Files,
+            "files/gone.md",
+            "要删的".into(),
+            "内容".into(),
+            1_700_000_000,
+        )
+        .unwrap();
+        ix.flush().unwrap();
+        ix.delete(SourceId::Files, "files/gone.md");
+        ix.flush().unwrap();
+
+        let mut srv = Server::start(&data, ix.index_handle(), 0, Log::silent()).unwrap();
+        {
+            let mut c = Client::connect(&data).unwrap();
+            let s = c.stats().unwrap();
+            assert_eq!(s.live, 0);
+            assert_eq!(s.tombstones, 1, "标记删除要算墓碑：{s:?}");
+        }
+        srv.stop();
+    }
+
+    #[test]
+    fn stats_reply_round_trips_and_escapes_source_names() {
+        let s = StatsReply {
+            live: 12,
+            tombstones: 3,
+            num_docs: 15,
+            segments: 4,
+            by_source: vec![
+                ("files".into(), 9),
+                // 来源名理论上不会有制表符，但编解码必须自洽 —— 少了解转义，
+                // 一个奇怪的来源名就能让整条响应错位
+                ("weird\tsource".into(), 3),
+            ],
+        };
+        let encoded = encode_stats_reply(&s);
+        assert_eq!(encoded.lines().count(), 3, "一行头 + 两个来源：{encoded:?}");
+        assert_eq!(parse_stats_reply(&encoded).unwrap(), s);
+
+        // 空索引是合法状态：0 行来源，不能当成"响应被截断"
+        let empty = StatsReply {
+            live: 0,
+            tombstones: 0,
+            num_docs: 0,
+            segments: 0,
+            by_source: vec![],
+        };
+        assert_eq!(
+            parse_stats_reply(&encode_stats_reply(&empty)).unwrap(),
+            empty
+        );
+    }
+
+    #[test]
+    fn stats_reply_surfaces_server_errors() {
+        let e = parse_stats_reply("err\t水位表不可读").unwrap_err();
+        assert_eq!(e, "水位表不可读", "错误原因要原样透出，别被吞掉");
+
+        // 字段缺失必须是错误，不能拿 0 顶上：少一个数字就下结论，比报错更糟
+        assert!(parse_stats_reply("ok\t1\t2\t3").is_err());
     }
 
     #[test]
