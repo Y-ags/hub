@@ -479,7 +479,7 @@ fn shared_handle_sees_commits_from_the_writer() {
 #[test]
 fn shared_handle_does_not_hold_the_writer_lock() {
     let dir = TempDir::new().unwrap();
-    let mut ix = Indexer::open(dir.path()).unwrap();
+    let ix = Indexer::open(dir.path()).unwrap();
     let _reader = ix.index_handle();
 
     // 同一进程里再开一个 Indexer 并写入（模拟 CLI 的 --local 路径）。

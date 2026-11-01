@@ -14,3 +14,4 @@ hub-store = { path = "../hub-store" }
 hub-connectors = { path = "../hub-connectors" }
 hub-engine = { path = "../hub-engine" }
 hub-daemon = { path = "../hub-daemon" }
+hub-ui = { path = "../hub-ui" }

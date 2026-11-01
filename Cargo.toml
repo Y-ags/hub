@@ -6,6 +6,7 @@ members = [
     "crates/hub-connectors",
     "crates/hub-engine",
     "crates/hub-daemon",
+    "crates/hub-ui",
     "crates/hub-cli",
 ]
 

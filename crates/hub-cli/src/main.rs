@@ -52,6 +52,13 @@ hub —— 本地离线多源个人检索中枢
         看后台日志
   hub daemon run       前台运行（调试用，日志直接打屏）
 
+界面:
+  hub ui [--hotkey ctrl+alt+space] [--hidden] [--detach]
+        唤起式搜索窗。Ctrl+Alt+Space 随时唤出，Esc 收起，Enter 打开选中项
+        --detach 放到后台（不占终端），配合开机自启用
+        --hidden 只注册热键、不先弹窗
+        已经开着时再执行一次不会开第二个，只是把窗口唤出来
+
   hub              进入交互模式（只有检索）
 
 全局参数:
@@ -78,6 +85,7 @@ fn run() -> Result<(), String> {
         "index" | "i" => cmd_index(&data, &args[1..]),
         "search" | "s" | "q" => cmd_search(&data, &args[1..]),
         "daemon" | "d" => cmd_daemon(&data, &args[1..]),
+        "ui" | "gui" => cmd_ui(&data, &args[1..]),
         "stats" => cmd_stats(&data),
         "merge" => cmd_merge(&data),
         "reset" => cmd_reset(&data, &args[1..]),
@@ -799,6 +807,88 @@ fn daemon_log(data: &Path, args: &[String]) -> Result<(), String> {
 // ============================================================
 // 其他子命令
 // ============================================================
+
+fn cmd_ui(data: &Path, args: &[String]) -> Result<(), String> {
+    let mut hotkey: Option<String> = None;
+    let mut hidden = false;
+    let mut detach = false;
+
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--hotkey" => {
+                let v = it.next().ok_or_else(|| {
+                    "--hotkey 需要组合，例如 ctrl+alt+space".to_string()
+                })?;
+                // 先校验再启动：热键写错时窗口已经弹出来了，用户会以为
+                // "热键不好使"，其实只是拼错
+                let norm = hub_ui::validate_hotkey(v).ok_or_else(|| {
+                    format!("无法识别的热键 `{v}`。示例：ctrl+alt+space")
+                })?;
+                // 存规范化后的写法，后面两条路（前台 / 后台）都不用再管用户怎么写的
+                hotkey = Some(norm);
+            }
+            "--hidden" => hidden = true,
+            "--detach" => detach = true,
+            other => return Err(format!("未知参数 {other}")),
+        }
+    }
+
+    if detach {
+        spawn_ui_background(data, hotkey.as_deref())?;
+        return Ok(());
+    }
+
+    if let Some(h) = &hotkey {
+        println!("热键：{h}");
+    }
+    hub_ui::run(data, hub_ui::Options { hotkey, hidden })
+}
+
+/// 把界面放到后台：起一个不带控制台的自己。
+///
+/// 为什么不直接在当前进程里脱离：界面要跑消息循环，而调用方（终端）还等着
+/// 命令返回。分开是两个进程各自的自然行为，也方便以后单独结束界面。
+fn spawn_ui_background(data: &Path, hotkey: Option<&str>) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("找不到自身路径：{e}"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("ui").arg("--hidden").arg("--data").arg(data);
+    if let Some(h) = hotkey {
+        cmd.arg("--hotkey").arg(h);
+    }
+    // 脱离标志位只维护一份，和 daemon 共用（见 hub_daemon::process）
+    let child = hub_daemon::process::spawn_detached_command(&mut cmd)
+        .map_err(|e| format!("启动失败：{e}"))?;
+    let pid = child.id();
+    drop(child);
+
+    // 子进程那边可能立刻失败（注册窗口类、建字体、热键全被占……），
+    // 而失败信息写在它自己的 stderr 里 —— 已经被重定向到 null 了。
+    // 所以父进程不能只报"已启动"，要等窗口真出现。
+    // 窗口是隐藏的，但 FindWindow 找得到隐藏窗口。
+    let mut up = false;
+    for _ in 0..24 {
+        if hub_ui::window_exists() {
+            up = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if !up {
+        return Err(format!(
+            "进程起来了（pid {pid}）但窗口没建出来。\n\
+             多半是热键被别的程序占了 —— 换一个：hub ui --hotkey ctrl+alt+j --detach"
+        ));
+    }
+
+    println!("搜索窗已在后台启动（pid {pid}，窗口隐藏，等热键唤起）。");
+    println!(
+        "热键：{}   （被占用时会自动退到 Ctrl+Alt+K）",
+        hotkey.unwrap_or("Ctrl+Alt+Space")
+    );
+    println!("要它开机自启，把这条命令做成快捷方式放进 shell:startup");
+    Ok(())
+}
 
 fn cmd_stats(data: &Path) -> Result<(), String> {
     let indexer = Indexer::open(data).map_err(|e| format!("打开数据目录失败：{e}"))?;

@@ -17,11 +17,12 @@ hub search 上个月写的那个rust内存相关的代码片段
 
 ```bash
 cargo build --release          # 首次约 2–5 分钟（Tantivy + bundled SQLite）
-cargo test                     # 106 条测试，全部离线可跑
+cargo test                     # 109 条测试，全部离线可跑
 
 ./target/release/hub daemon start ~/code ~/notes --history --autostart  # 一步到位
 ./target/release/hub daemon status                            # 看它在干什么
 ./target/release/hub search "零拷贝 mmap" --limit 5
+./target/release/hub ui --detach                              # 搜索窗常驻，Ctrl+Alt+Space 唤出
 ./target/release/hub daemon log -n 20                         # 后台日志
 ./target/release/hub daemon stop                              # 优雅停止（不影响开机自启）
 ```
@@ -62,6 +63,58 @@ cargo test                     # 106 条测试，全部离线可跑
 | 二次索引（增量） | 0.01 s，全部跳过 |
 | 改一个文件 → 可搜到 | 1 秒内（debounce 800ms） |
 | 冷启动对账（几千文件） | 数十毫秒 |
+
+**内存实测**（6371 篇真实语料：6324 条历史 + 47 个源文件）：
+
+| 场景 | 工作集 | 说明 |
+|---|---|---|
+| daemon 空闲 | 20.0 MB | 跑过几次查询后 23 MB，不再涨 |
+| 搜索窗（走 IPC） | 16.6 → 22.4 MB | 起来 16.6，出结果后 22.4 |
+| 搜索窗（daemon 没在跑，自己开索引） | 22.3 → 24.4 MB | 多出来的就是自己那份 Tantivy reader |
+| `hub search`（本地） | 峰值 18–19 MB | 其中检索只占 3–7 ms，其余全是进程启动 |
+| `hub search`（经 daemon） | 峰值 16 MB | 不打开索引，省 2–3 MB |
+| 全量索引 6371 篇（一次性） | 峰值 50.5 MB | Tantivy writer 的预算，不在常驻路径上 |
+
+常驻成本合计约 **45 MB**（daemon + 搜索窗）。这些数字是**工作集**，含 mmap 映射的
+段文件页；私有字节会更小，但没有单独测。
+
+---
+
+## 界面：一个键唤出来的搜索框
+
+```bash
+hub ui                     # 前台跑，Ctrl+Alt+Space 唤出
+hub ui --detach            # 丢到后台（关掉终端也不影响）
+hub ui --hotkey ctrl+alt+j # 默认组合被别的软件占了时换一个
+```
+
+窗口是无边框的，不占任务栏也不进 Alt+Tab —— 它是"一个浮层"，不是一个窗口。
+再执行一次 `hub ui` 不会开出第二个窗口，而是把已经有的那个叫到前面来。
+
+| 键 | 行为 |
+|---|---|
+| ↑ ↓ / PgUp PgDn | 选结果 |
+| Enter | 用系统默认程序打开 |
+| Ctrl+Enter | 在资源管理器里定位 |
+| Ctrl+Shift+C | 复制路径（不抢 `Ctrl+C`，那是复制你打的字） |
+| Esc | 收起 |
+
+底部状态栏会写清楚这次查询走的是哪条路：
+
+```
+27 条 · 5.1 ms · 实时 · 索引 6371 篇     ← daemon 在跑，走 IPC，新提交立刻可见
+13 条 · 8.3 ms · 本地 · 索引 6371 篇     ← daemon 没在跑，界面自己开索引
+```
+
+**为什么是 Win32 原生控件而不是 egui**：两个理由，第一个是硬的。
+
+1. **中文输入法**。用中文搜中文，而 IME 在自绘窗口上要自己接 `WM_IME_COMPOSITION`、
+   自己画候选窗、自己处理光标位置。Edit 控件这些全是现成的，跟着系统输入法走。
+2. **零新依赖**。egui 要新拉一堆 crate；这里只把已经躺在依赖树里的 `windows-sys`
+   多开几个 feature。结果列表是自绘的（`LBS_OWNERDRAWFIXED`），其余全是系统行为。
+
+代价是**只有 Windows 版**。Linux/macOS 以后要做，IME 在 GTK/Qt 上是现成的，
+不需要现在为它做架构妥协。
 
 ---
 
@@ -140,7 +193,7 @@ daemon 在跑的时候，`hub search` 不再自己打开索引，而是向它发
 |---|---|
 | daemon 在写、CLI 又开一份引擎，两个写者抢同一份目录锁 | 查询只读，不碰写入器 |
 | CLI 新开的 reader 要等 `OnCommitWithDelay` 才看到最新提交 | 用 daemon 手里那个 commit 即 reload 的 reader |
-| 以后要加 UI，需要一条"问一句就出结果"的通道 | 协议已经就位 |
+| 以后要加 UI，需要一条"问一句就出结果"的通道 | 协议已经就位（搜索窗现在就走它） |
 
 ```
 $ hub search 零拷贝
@@ -168,6 +221,7 @@ IPC：\\.\pipe\hub-021d15d4524f4531
 
 ```
 hub-cli         参数 / IO / 打印，不含检索逻辑也不含采集逻辑
+hub-ui          唤起式搜索窗（Win32 原生控件，零第三方依赖，仅 Windows）
 hub-daemon      常驻进程：watcher + debounce + 对账 + 空闲合并 + 历史轮询 + 自启 + IPC
 hub-engine      采集流水线（scan_all / index_paths / remove_paths / reconcile）
 hub-store       MetaStore(SQLite) + HubIndex(Tantivy) + Indexer(胶水)
@@ -248,11 +302,24 @@ hub-connectors  files / terminal 采集器（零依赖）
 | 跳过规则拿绝对路径判 | root 在 `%TEMP%` / `%APPDATA%` 下时整棵树都被判成噪声。只能判 root 以下的相对路径 |
 | `DETACHED_PROCESS` 就够脱离父进程 | 父进程在 Job Object 里时还会被一起带走，要加 `CREATE_BREAKAWAY_FROM_JOB` |
 
+### 界面（Win32）
+
+| 原假设 | 真实情况 |
+|---|---|
+| 子类化输入框是正统做法 | **踩坑**。换掉 Edit 的窗口过程后，那段代码要靠父窗口 `GWLP_USERDATA` 拿 `App`，而 Edit 是在 App 指针写进去**之前**创建的 —— 那段时间消息全落到 `DefWindowProc`，表现是"能存文本、但画不出来、也从不发 `EN_CHANGE`"。改成在消息循环里拦 `WM_KEYDOWN`，Edit 的窗口过程一行不动 |
+| 监听 `EN_CHANGE` 就够了 | 程序化 `SetWindowTextW` **只发** `EN_UPDATE(0x0400)`，不发 `EN_CHANGE(0x0300)`。只听后者会让脚本注入 / 输入法上屏 / 粘贴全失效 |
+| `DT_PATH_ELLIPSIS` 会省略路径中间 | 它只认反斜杠。终端历史的 uri 是 `terminal://C:/Users/...`，一个反斜杠都没有 → 它只把开头换成 `...`，剩下照画，**直接画到窗口外面**。得自己按像素量 |
+| `Box::new(app)` + `&mut *app` 交给窗口就行 | 双重释放：`run()` 返回时 drop 一次，`WM_NCDESTROY` 里又 drop 一次。要 `Box::into_raw` 把所有权交给窗口 |
+| `PostMessage` 能判断对方还活着 | 只要句柄有效就返回成功，**哪怕对端卡死**。要用 `SendMessageTimeoutW(..., SMTO_ABORTIFHUNG, 800ms)` |
+| 脱离标志位抄一份就行 | 抄的那份漏了 `CREATE_BREAKAWAY_FROM_JOB`，表现是"报已启动、一秒后进程没了"。现在只维护一份（`hub_daemon::process`） |
+| 截图工具能直接抓窗口 | UI 是 `PER_MONITOR_AWARE_V2`（客户区 950×650），截图工具按 96DPI 虚拟化后 `GetClientRect`/`BitBlt` 只算得到 760×520，抓到的是窗口左上角一块 |
+
 ---
 
 ## 已知边界
 
-- **没有图形界面**：只有 CLI
+- **界面只有 Windows 版**：Win32 原生控件（原因见上），Linux/macOS 没做
+- **搜索窗没有托盘图标**：想关掉它只能去任务管理器结束 `hub.exe`
 - **没有截图 OCR、聊天记录 connector**
 - **开机自启只实现了 Windows**（HKCU Run 键）；Linux / macOS 需自己配 systemd unit / launchd
 - **非 UTF-8 文件直接跳过**（GBK 会变乱码，宁可漏不要脏）
@@ -268,7 +335,7 @@ hub-connectors  files / terminal 采集器（零依赖）
 ## 下一步
 
 ```
-1. egui UI + global-hotkey（IPC 通道已经就位）
+1. 搜索窗托盘图标（现在只能任务管理器杀进程）
 2. 截图 OCR / 聊天记录 connector
-3. 真机内存基准（上线前必须做）
+3. Linux / macOS 版界面（IME 在 GTK/Qt 上是现成的，成本比 Windows 低）
 ```

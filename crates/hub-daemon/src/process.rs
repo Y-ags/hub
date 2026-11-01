@@ -21,31 +21,49 @@ use std::path::Path;
 /// 三个标准流全部重定向到 null：daemon 自己往日志文件写，
 /// 保留继承的 stdout 句柄在脱离控制台后写入会失败。
 pub fn spawn_detached(data: &Path) -> std::io::Result<u32> {
+    let mut cmd = base_command(data)?;
+    spawn_detached_command(&mut cmd).map(|c| c.id())
+}
+
+/// 给任意一条已拼好参数的命令加上"脱离父进程"的处理，然后启动。
+///
+/// 从 `spawn_detached` 里抽出来，是因为 GUI 那条路（`hub ui --detach`）要起的是
+/// 另一个子命令，而它第一版把这几个标志位**又抄了一遍**、恰好漏了
+/// `CREATE_BREAKAWAY_FROM_JOB` —— 表现是命令打印"已在后台启动"、任务管理器里
+/// 也真能看到进程，一秒后它自己没了。抄常量这种事只该有一份。
+pub fn spawn_detached_command(
+    cmd: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    use std::process::Stdio;
+    // daemon 自己往日志文件写、界面自己开窗口，留着继承来的标准流只会
+    // 在控制台消失后写入失败
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
-        let try_flags = |flags: u32| -> std::io::Result<u32> {
-            let mut cmd = base_command(data)?;
-            {
-                use std::os::windows::process::CommandExt;
+        let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+        cmd.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
+        match cmd.spawn() {
+            Ok(c) => Ok(c),
+            // Job 不允许 breakaway（ERROR_ACCESS_DENIED）：退回不带该标志。
+            // 此时只能指望父进程不在一个"退出就杀光"的 Job 里。
+            Err(_) => {
                 cmd.creation_flags(flags);
+                cmd.spawn()
             }
-            cmd.spawn().map(|c| c.id())
-        };
-
-        match try_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB) {
-            Ok(pid) => Ok(pid),
-            // Job 不允许 breakaway：退回不带该标志（此时只能期望父进程不被杀 Job）
-            Err(_) => try_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP),
         }
     }
     #[cfg(not(windows))]
     {
-        // Unix 上父进程退出不会带走子进程，重定向标准流即可
-        base_command(data).and_then(|mut c| c.spawn().map(|x| x.id()))
+        // Unix 上父进程退出不会带走子进程，重定向标准流就够了
+        cmd.spawn()
     }
 }
 

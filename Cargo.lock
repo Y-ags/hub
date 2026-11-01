@@ -403,6 +403,7 @@ dependencies = [
  "hub-daemon",
  "hub-engine",
  "hub-store",
+ "hub-ui",
 ]
 
 [[package]]
@@ -447,6 +448,16 @@ dependencies = [
  "rusqlite",
  "tantivy",
  "tempfile",
+]
+
+[[package]]
+name = "hub-ui"
+version = "0.1.0"
+dependencies = [
+ "hub-core",
+ "hub-daemon",
+ "hub-store",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
